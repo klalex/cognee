@@ -1,3 +1,4 @@
+import importlib
 import os
 import inspect
 from numbers import Number
@@ -9,6 +10,32 @@ from cognee.shared.lru_cache import DATABASE_MAX_LRU_CACHE_SIZE
 from cognee.shared.logging_utils import get_logger
 
 logger = get_logger("VectorEngine")
+FALKOR_PROVIDER_ALIASES = {"falkor", "falkordb"}
+FALKOR_REGISTER_MODULES = (
+    "cognee_community_hybrid_adapter_falkor.register",
+    "cognee_community_hybrid_adapter_falkor",
+)
+
+
+def _try_load_falkor_adapter() -> None:
+    if "falkor" in supported_databases or "falkordb" in supported_databases:
+        return
+
+    for module_name in FALKOR_REGISTER_MODULES:
+        try:
+            importlib.import_module(module_name)
+            return
+        except ModuleNotFoundError as error:
+            if not str(error.name).startswith("cognee_community_hybrid_adapter_falkor"):
+                logger.warning(
+                    "Failed to import Falkor adapter module '%s': %s",
+                    module_name,
+                    error,
+                )
+                return
+        except Exception as error:
+            logger.warning("Failed to load Falkor adapter module '%s': %s", module_name, error)
+            return
 
 
 def _get_create_vector_engine_optional_defaults() -> dict:
@@ -191,6 +218,9 @@ def _create_vector_engine(
     """
     embedding_engine = get_embedding_engine()
 
+    if vector_db_provider in FALKOR_PROVIDER_ALIASES:
+        _try_load_falkor_adapter()
+
     provider_alias = {"falkordb": "falkor", "falkor": "falkordb"}
     provider_key = vector_db_provider
     if provider_key not in supported_databases:
@@ -331,6 +361,13 @@ def _create_vector_engine(
         )
 
     else:
+        if vector_db_provider in FALKOR_PROVIDER_ALIASES:
+            raise EnvironmentError(
+                f"Unsupported vector database provider: {vector_db_provider}. "
+                "Falkor support requires the community adapter. Install "
+                "`cognee-community-hybrid-adapter-falkor` and import "
+                "`cognee_community_hybrid_adapter_falkor.register` before Cognee startup."
+            )
         raise EnvironmentError(
             f"Unsupported vector database provider: {vector_db_provider}. "
             f"Supported providers are: {', '.join(list(supported_databases.keys()) + ['LanceDB', 'PGVector', 'neptune_analytics', 'ChromaDB'])}"

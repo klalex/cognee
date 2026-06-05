@@ -1,5 +1,6 @@
 """Factory function to get the appropriate graph client based on the graph type."""
 
+import importlib
 import inspect
 import os
 from numbers import Number
@@ -14,10 +15,36 @@ from .graph_db_interface import GraphDBInterface
 from .supported_databases import supported_databases
 
 logger = get_logger("GraphEngine")
+FALKOR_PROVIDER_ALIASES = {"falkor", "falkordb"}
+FALKOR_REGISTER_MODULES = (
+    "cognee_community_hybrid_adapter_falkor.register",
+    "cognee_community_hybrid_adapter_falkor",
+)
 
 
 def _normalize_graph_database_provider(provider: str) -> str:
     return provider.lower() if isinstance(provider, str) else provider
+
+
+def _try_load_falkor_adapter() -> None:
+    if "falkor" in supported_databases or "falkordb" in supported_databases:
+        return
+
+    for module_name in FALKOR_REGISTER_MODULES:
+        try:
+            importlib.import_module(module_name)
+            return
+        except ModuleNotFoundError as error:
+            if not str(error.name).startswith("cognee_community_hybrid_adapter_falkor"):
+                logger.warning(
+                    "Failed to import Falkor adapter module '%s': %s",
+                    module_name,
+                    error,
+                )
+                return
+        except Exception as error:
+            logger.warning("Failed to load Falkor adapter module '%s': %s", module_name, error)
+            return
 
 
 def _get_create_graph_engine_optional_defaults() -> dict:
@@ -287,6 +314,9 @@ def _create_graph_engine(
         specified.
     """
 
+    if graph_database_provider in FALKOR_PROVIDER_ALIASES:
+        _try_load_falkor_adapter()
+
     provider_alias = {"falkordb": "falkor", "falkor": "falkordb"}
     provider_key = graph_database_provider
     if provider_key not in supported_databases:
@@ -476,6 +506,14 @@ def _create_graph_engine(
         "falkor",
         "falkordb",
     ]
+    if graph_database_provider in FALKOR_PROVIDER_ALIASES:
+        raise EnvironmentError(
+            f"Unsupported graph database provider: {graph_database_provider}. "
+            "Falkor support requires the community adapter. Install "
+            "`cognee-community-hybrid-adapter-falkor` and import "
+            "`cognee_community_hybrid_adapter_falkor.register` before Cognee startup."
+        )
+
     raise EnvironmentError(
         f"Unsupported graph database provider: {graph_database_provider}. "
         f"Supported providers are: {', '.join(all_providers)}"
