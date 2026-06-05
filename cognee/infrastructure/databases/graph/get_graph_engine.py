@@ -473,6 +473,8 @@ def _create_graph_engine(
         "postgres",
         "neptune",
         "neptune_analytics",
+        "falkor",
+        "falkordb",
     ]
     raise EnvironmentError(
         f"Unsupported graph database provider: {graph_database_provider}. "
