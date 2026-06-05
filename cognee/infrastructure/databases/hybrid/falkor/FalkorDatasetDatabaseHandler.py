@@ -43,6 +43,15 @@ class FalkorDatasetDatabaseHandler:
 
         # Dataset scope is represented by Falkor logical database name.
         dataset_db_name = str(dataset_id)
+        
+        await cls._initialize_graph_dataset(
+            dataset_db_name=dataset_db_name,
+            graph_url=graph_config.graph_database_url,
+            graph_port=graph_config.graph_database_port,
+            graph_key=graph_config.graph_database_key,
+            graph_username=graph_config.graph_database_username,
+            graph_password=graph_config.graph_database_password,
+        )
 
         return {
             "graph_database_provider": "falkor",
@@ -62,6 +71,39 @@ class FalkorDatasetDatabaseHandler:
                 "port": vector_config.vector_db_port,
             },
         }
+
+    @classmethod
+    async def _initialize_graph_dataset(
+        cls,
+        dataset_db_name: str,
+        graph_url: str,
+        graph_port: int,
+        graph_key: str,
+        graph_username: str,
+        graph_password: str,
+    ) -> None:
+        """Ensure Falkor graph key exists for the dataset database name.
+
+        The community Falkor adapter may call index discovery commands through
+        GRAPH.RO_QUERY. On a non-existent graph key Falkor raises:
+        "Invalid graph operation on empty key". We create a tiny marker node
+        once at dataset provisioning time so first pipeline writes are stable.
+        """
+        graph_engine = create_graph_engine(
+            graph_database_provider="falkor",
+            graph_file_path="",
+            graph_database_url=graph_url,
+            graph_database_name=dataset_db_name,
+            graph_database_username=graph_username,
+            graph_database_password=graph_password,
+            graph_database_port=graph_port,
+            graph_database_key=graph_key,
+            graph_dataset_database_handler=FALKOR_DATASET_DATABASE_HANDLER,
+        )
+        await graph_engine.query(
+            "MERGE (n:__CogneeDatasetMarker {id:'dataset_root'}) RETURN n",
+            {},
+        )
 
     @classmethod
     async def resolve_dataset_connection_info(
