@@ -14,6 +14,16 @@ from cognee.modules.users.models import DatasetDatabase
 from cognee.modules.users.models import User
 
 
+def _select_prefixed_config(config: dict, prefix: str) -> dict:
+    """Return only keys for one side of DatasetDatabase config.
+
+    Some community/hybrid handlers may return both graph and vector keys from a
+    single create_dataset() call. Filtering by prefix keeps record creation
+    robust and prevents duplicate keyword collisions.
+    """
+    return {key: value for key, value in config.items() if key.startswith(prefix)}
+
+
 async def _get_vector_db_info(dataset_id: UUID, user: User) -> dict:
     vector_config = get_vectordb_config()
 
@@ -97,8 +107,12 @@ async def get_or_create_dataset_database(
     if existing_dataset_database:
         return existing_dataset_database
 
-    graph_config_dict = await _get_graph_db_info(dataset_id, user)
-    vector_config_dict = await _get_vector_db_info(dataset_id, user)
+    graph_config_dict = _select_prefixed_config(
+        await _get_graph_db_info(dataset_id, user), "graph_"
+    )
+    vector_config_dict = _select_prefixed_config(
+        await _get_vector_db_info(dataset_id, user), "vector_"
+    )
 
     async with db_engine.get_async_session() as session:
         # If there are no existing rows build a new row
