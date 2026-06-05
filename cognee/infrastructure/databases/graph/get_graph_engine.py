@@ -287,8 +287,13 @@ def _create_graph_engine(
         specified.
     """
 
-    if graph_database_provider in supported_databases:
-        adapter = supported_databases[graph_database_provider]
+    provider_alias = {"falkordb": "falkor", "falkor": "falkordb"}
+    provider_key = graph_database_provider
+    if provider_key not in supported_databases:
+        provider_key = provider_alias.get(provider_key, provider_key)
+
+    if provider_key in supported_databases:
+        adapter = supported_databases[provider_key]
 
         return adapter(
             graph_database_url=graph_database_url,

@@ -71,8 +71,12 @@ class GraphConfig(BaseSettings):
     @pydantic.model_validator(mode="after")
     def fill_derived(self):
         provider = self.graph_database_provider.lower()
+        if provider == "falkordb":
+            provider = "falkor"
         self.graph_database_provider = provider
         graph_dataset_database_handler = self.graph_dataset_database_handler.lower()
+        if graph_dataset_database_handler == "falkordb":
+            graph_dataset_database_handler = "falkor"
         self.graph_dataset_database_handler = graph_dataset_database_handler
         if provider == "kuzu" and graph_dataset_database_handler == "ladybug":
             self.graph_dataset_database_handler = "kuzu"
@@ -80,6 +84,8 @@ class GraphConfig(BaseSettings):
             self.graph_dataset_database_handler = "postgres_graph"
         if provider == "neo4j" and graph_dataset_database_handler in ("ladybug", "neo4j"):
             self.graph_dataset_database_handler = "neo4j"
+        if provider == "falkor" and graph_dataset_database_handler in ("ladybug", "falkor"):
+            self.graph_dataset_database_handler = "falkor"
         base_config = get_base_config()
 
         databases_directory_path = os.path.join(base_config.system_root_directory, "databases")

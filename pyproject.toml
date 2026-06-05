@@ -98,6 +98,7 @@ fastembed = [
 ]
 
 neo4j = ["neo4j>=5.28.0,<6"]
+falkor = ["cognee-community-hybrid-adapter-falkor ; python_version >= '3.11' and python_version <= '3.13'"]
 neptune = ["langchain_aws>=0.2.22"]
 postgres = [
     "psycopg2>=2.9.10,<3",

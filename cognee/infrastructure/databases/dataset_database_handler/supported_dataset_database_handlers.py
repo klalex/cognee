@@ -16,6 +16,9 @@ from cognee.infrastructure.databases.vector.pgvector.PGVectorDatasetDatabaseHand
 from cognee.infrastructure.databases.graph.postgres.PostgresGraphDatasetDatabaseHandler import (
     PostgresGraphDatasetDatabaseHandler,
 )
+from cognee.infrastructure.databases.hybrid.falkor.FalkorDatasetDatabaseHandler import (
+    FalkorDatasetDatabaseHandler,
+)
 
 supported_dataset_database_handlers = {
     "neo4j_aura_dev": {
@@ -40,4 +43,12 @@ supported_dataset_database_handlers = {
         "handler_provider": "ladybug",
     },
     "kuzu": {"handler_instance": LadybugDatasetDatabaseHandler, "handler_provider": "kuzu"},
+    "falkor": {
+        "handler_instance": FalkorDatasetDatabaseHandler,
+        "handler_provider": "falkor",
+    },
+    "falkordb": {
+        "handler_instance": FalkorDatasetDatabaseHandler,
+        "handler_provider": "falkor",
+    },
 }

@@ -191,8 +191,13 @@ def _create_vector_engine(
     """
     embedding_engine = get_embedding_engine()
 
-    if vector_db_provider in supported_databases:
-        adapter = supported_databases[vector_db_provider]
+    provider_alias = {"falkordb": "falkor", "falkor": "falkordb"}
+    provider_key = vector_db_provider
+    if provider_key not in supported_databases:
+        provider_key = provider_alias.get(provider_key, provider_key)
+
+    if provider_key in supported_databases:
+        adapter = supported_databases[provider_key]
 
         return adapter(
             url=vector_db_url,

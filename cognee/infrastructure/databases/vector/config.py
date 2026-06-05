@@ -42,11 +42,17 @@ class VectorConfig(BaseSettings):
         # dataset handler instead of the default lancedb one. This mirrors the same
         # pattern used in GraphConfig for postgres → postgres_graph.
         provider = self.vector_db_provider.lower()
+        if provider == "falkordb":
+            provider = "falkor"
         self.vector_db_provider = provider
         vector_dataset_database_handler = self.vector_dataset_database_handler.lower()
+        if vector_dataset_database_handler == "falkordb":
+            vector_dataset_database_handler = "falkor"
         self.vector_dataset_database_handler = vector_dataset_database_handler
         if provider == "pgvector" and vector_dataset_database_handler in ("lancedb", "pgvector"):
             self.vector_dataset_database_handler = "pgvector"
+        if provider == "falkor" and vector_dataset_database_handler in ("lancedb", "falkor"):
+            self.vector_dataset_database_handler = "falkor"
         return self
 
     @pydantic.model_validator(mode="after")
