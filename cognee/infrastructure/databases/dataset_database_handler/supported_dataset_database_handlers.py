@@ -13,11 +13,17 @@ from cognee.infrastructure.databases.graph.ladybug.LadybugDatasetDatabaseHandler
 from cognee.infrastructure.databases.vector.pgvector.PGVectorDatasetDatabaseHandler import (
     PGVectorDatasetDatabaseHandler,
 )
+from cognee.infrastructure.databases.vector.turso.TursoVectorDatasetDatabaseHandler import (
+    TursoVectorDatasetDatabaseHandler,
+)
 from cognee.infrastructure.databases.graph.postgres.PostgresGraphDatasetDatabaseHandler import (
     PostgresGraphDatasetDatabaseHandler,
 )
 from cognee.infrastructure.databases.hybrid.falkor.FalkorDatasetDatabaseHandler import (
     FalkorDatasetDatabaseHandler,
+)
+from cognee.infrastructure.databases.graph.turso.TursoGraphDatasetDatabaseHandler import (
+    TursoGraphDatasetDatabaseHandler,
 )
 
 supported_dataset_database_handlers = {
@@ -33,6 +39,10 @@ supported_dataset_database_handlers = {
     "pgvector": {
         "handler_instance": PGVectorDatasetDatabaseHandler,
         "handler_provider": "pgvector",
+    },
+    "turso": {
+        "handler_instance": TursoVectorDatasetDatabaseHandler,
+        "handler_provider": "turso",
     },
     "postgres_graph": {
         "handler_instance": PostgresGraphDatasetDatabaseHandler,
@@ -50,5 +60,9 @@ supported_dataset_database_handlers = {
     "falkordb": {
         "handler_instance": FalkorDatasetDatabaseHandler,
         "handler_provider": "falkor",
+    },
+    "turso_graph": {
+        "handler_instance": TursoGraphDatasetDatabaseHandler,
+        "handler_provider": "turso",
     },
 }

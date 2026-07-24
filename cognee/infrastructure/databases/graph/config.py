@@ -86,6 +86,8 @@ class GraphConfig(BaseSettings):
             self.graph_dataset_database_handler = "neo4j"
         if provider == "falkor" and graph_dataset_database_handler in ("ladybug", "falkor"):
             self.graph_dataset_database_handler = "falkor"
+        if provider == "turso" and graph_dataset_database_handler in ("ladybug", "turso"):
+            self.graph_dataset_database_handler = "turso_graph"
         base_config = get_base_config()
 
         databases_directory_path = os.path.join(base_config.system_root_directory, "databases")
