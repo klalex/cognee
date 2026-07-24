@@ -1,3 +1,4 @@
+import asyncio
 import json
 import inspect
 from uuid import UUID
@@ -23,6 +24,10 @@ from cognee.modules.data.methods import (
 from .save_data_item_to_storage import save_data_item_to_storage
 from .data_item_to_text_file import data_item_to_text_file
 from .data_item import DataItem
+
+
+INGEST_INTEGRITY_RETRY_ATTEMPTS = 5
+INGEST_INTEGRITY_RETRY_BASE_DELAY_SECONDS = 0.05
 
 
 async def ingest_data(
@@ -249,16 +254,19 @@ async def ingest_data(
 
         return existing_data_points + dataset_new_data_points + new_datapoints
 
-    # data.id is a content hash, so concurrent ingests of the same content both
-    # see it as missing and try to INSERT the same primary key — the loser hits
-    # "UNIQUE constraint failed: data.id". Retrying re-reads the now-committed row
-    # and takes the existing-data branch (update + link) instead of inserting.
-    # File writes are content-addressed, so re-running is idempotent.
-    try:
-        return await store_data_to_dataset(
-            data, dataset_name, user, node_set, dataset_id, preferred_loaders
-        )
-    except IntegrityError:
-        return await store_data_to_dataset(
-            data, dataset_name, user, node_set, dataset_id, preferred_loaders
-        )
+    # data.id is deterministic, so concurrent ingests of the same content can
+    # all observe a missing row and then race to INSERT the same primary key.
+    # A single retry is insufficient with multiple API/worker processes because
+    # another contender can win the retry too. Re-read with bounded exponential
+    # backoff until the committed row is visible and the existing-data path is
+    # taken. File writes are content-addressed, so re-running is idempotent.
+    for attempt in range(INGEST_INTEGRITY_RETRY_ATTEMPTS):
+        try:
+            return await store_data_to_dataset(
+                data, dataset_name, user, node_set, dataset_id, preferred_loaders
+            )
+        except IntegrityError:
+            if attempt == INGEST_INTEGRITY_RETRY_ATTEMPTS - 1:
+                raise
+
+            await asyncio.sleep(INGEST_INTEGRITY_RETRY_BASE_DELAY_SECONDS * (2**attempt))
