@@ -19,24 +19,28 @@ FALKOR_REGISTER_MODULES = (
 
 
 def _try_load_falkor_adapter() -> None:
-    if "falkor" in supported_databases or "falkordb" in supported_databases:
-        return
+    from cognee.infrastructure.databases.hybrid.falkor.compat import (
+        patch_falkor_adapter_provenance_kwargs,
+    )
 
-    for module_name in FALKOR_REGISTER_MODULES:
-        try:
-            importlib.import_module(module_name)
-            return
-        except ModuleNotFoundError as error:
-            if not str(error.name).startswith("cognee_community_hybrid_adapter_falkor"):
-                logger.warning(
-                    "Failed to import Falkor adapter module '%s': %s",
-                    module_name,
-                    error,
-                )
+    if "falkor" not in supported_databases and "falkordb" not in supported_databases:
+        for module_name in FALKOR_REGISTER_MODULES:
+            try:
+                importlib.import_module(module_name)
+                break
+            except ModuleNotFoundError as error:
+                if not str(error.name).startswith("cognee_community_hybrid_adapter_falkor"):
+                    logger.warning(
+                        "Failed to import Falkor adapter module '%s': %s",
+                        module_name,
+                        error,
+                    )
+                    return
+            except Exception as error:
+                logger.warning("Failed to load Falkor adapter module '%s': %s", module_name, error)
                 return
-        except Exception as error:
-            logger.warning("Failed to load Falkor adapter module '%s': %s", module_name, error)
-            return
+
+    patch_falkor_adapter_provenance_kwargs()
 
 
 def _get_create_vector_engine_optional_defaults() -> dict:
