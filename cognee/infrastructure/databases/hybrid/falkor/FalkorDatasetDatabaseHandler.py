@@ -4,12 +4,12 @@ from typing import Optional
 from cognee.infrastructure.databases.graph import get_graph_config
 from cognee.infrastructure.databases.graph.get_graph_engine import (
     create_graph_engine,
-    evict_graph_engine,
+    graph_engine_cache,
 )
 from cognee.infrastructure.databases.vector import get_vectordb_config
 from cognee.infrastructure.databases.vector.create_vector_engine import (
     create_vector_engine,
-    evict_vector_engine,
+    vector_engine_cache,
 )
 from cognee.modules.users.models import DatasetDatabase, User
 
@@ -143,31 +143,8 @@ class FalkorDatasetDatabaseHandler:
         graph_info = dataset_database.graph_database_connection_info or {}
         vector_info = dataset_database.vector_database_connection_info or {}
 
-        evict_graph_engine(
-            graph_database_provider=dataset_database.graph_database_provider,
-            graph_file_path="",
-            graph_database_url=dataset_database.graph_database_url,
-            graph_database_name=dataset_database.graph_database_name,
-            graph_database_username=graph_info.get("graph_database_username", ""),
-            graph_database_password=graph_info.get("graph_database_password", ""),
-            graph_database_host=graph_info.get("graph_database_host", ""),
-            graph_database_allow_anonymous=graph_info.get("graph_database_allow_anonymous", False),
-            graph_database_port=graph_info.get("graph_database_port", ""),
-            graph_database_key=dataset_database.graph_database_key,
-            graph_dataset_database_handler=FALKOR_DATASET_DATABASE_HANDLER,
-        )
-
-        evict_vector_engine(
-            vector_db_provider=dataset_database.vector_database_provider,
-            vector_db_url=dataset_database.vector_database_url,
-            vector_db_name=dataset_database.vector_database_name,
-            vector_db_port=vector_info.get("port", ""),
-            vector_db_key=dataset_database.vector_database_key,
-            vector_dataset_database_handler=FALKOR_DATASET_DATABASE_HANDLER,
-            vector_db_username=vector_info.get("username", ""),
-            vector_db_password=vector_info.get("password", ""),
-            vector_db_host=vector_info.get("host", ""),
-        )
+        await graph_engine_cache.aevict_for_database(dataset_database.graph_database_name)
+        await vector_engine_cache.aevict_for_database(dataset_database.vector_database_name)
 
         # Best-effort cleanup for adapters that support pruning the scoped dataset DB.
         graph_engine = create_graph_engine(
