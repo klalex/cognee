@@ -8,6 +8,38 @@ from typing import Callable
 _PROVENANCE_KWARGS_PATCHED = False
 
 
+def patch_falkor_adapter_graph_data() -> None:
+    """Read logical endpoints from topology, not optional relationship properties.
+
+    The community adapter's edge writer permits empty properties, but its
+    reader requires source_node_id/target_node_id. Existing graphs therefore
+    need a reader fix, not just changes to future writes.
+    """
+    try:
+        from cognee_community_hybrid_adapter_falkor.falkor_adapter import FalkorDBAdapter
+    except ImportError:
+        return
+
+    FalkorDBAdapter.get_graph_data = _get_graph_data
+
+
+async def _get_graph_data(self):
+    result = await self.query("MATCH (n) RETURN n.id, properties(n)")
+    nodes = [(row[0], row[1]) for row in getattr(result, "result_set", result)]
+    result = await self.query("MATCH (n)-[r]->(m) RETURN n.id, m.id, TYPE(r), properties(r)")
+    edges = []
+    for source_id, target_id, relationship_type, properties in getattr(
+        result, "result_set", result
+    ):
+        properties = dict(properties or {})
+        # Stored names may differ from the sanitized Cypher relationship type.
+        relationship_name = properties.get("relationship_name") or relationship_type
+        # Do not propagate stale denormalized endpoints during a migration.
+        properties.update(source_node_id=source_id, target_node_id=target_id)
+        edges.append((source_id, target_id, relationship_name, properties))
+    return nodes, edges
+
+
 def patch_falkor_adapter_provenance_kwargs() -> None:
     """Accept GraphDBInterface provenance kwargs that older Falkor adapters reject.
 

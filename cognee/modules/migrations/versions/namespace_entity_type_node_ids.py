@@ -790,8 +790,11 @@ async def _edges_needing_reassert(graph_engine, at_risk: list) -> list:
     """
     try:
         rows = await graph_engine.query(
-            "MATCH (a:Node)-[r:EDGE]->(b:Node) RETURN a.id, b.id, r.relationship_name"
+            "MATCH (a)-[r]->(b) RETURN a.id, b.id, coalesce(r.relationship_name, type(r))"
         )
+        present = {
+            (str(row[0]), str(row[1]), str(row[2])) for row in getattr(rows, "result_set", rows)
+        }
     except Exception as error:
         logger.info(
             "namespace migration: edge listing unavailable (%s), re-asserting all "
@@ -801,7 +804,6 @@ async def _edges_needing_reassert(graph_engine, at_risk: list) -> list:
         )
         return at_risk
 
-    present = {(str(row[0]), str(row[1]), str(row[2])) for row in rows}
     dropped = [edge for edge in at_risk if (edge[0], edge[1], edge[2]) not in present]
     logger.info(
         "namespace migration: %d of %d at-risk edge(s) were dropped and need re-asserting",

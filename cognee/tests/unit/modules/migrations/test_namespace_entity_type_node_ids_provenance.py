@@ -1,18 +1,44 @@
 from types import SimpleNamespace
+from unittest.mock import AsyncMock
 from uuid import uuid4
 
 import pytest
 
 from cognee.infrastructure.databases.provenance import (
-    EdgeIdentity,
     GRAPH_DELETE_MODE_GRAPH_PROVENANCE,
     GRAPH_DELETE_MODE_KEY,
     GRAPH_PROVENANCE_VERSION,
     GRAPH_PROVENANCE_VERSION_KEY,
+    EdgeIdentity,
     make_source_ref_key,
     make_source_run_ref,
 )
-from cognee.modules.migrations.versions.namespace_entity_type_node_ids import _migrate_graph
+from cognee.modules.migrations.versions.namespace_entity_type_node_ids import (
+    _edges_needing_reassert,
+    _migrate_graph,
+)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("legacy_result", [False, True])
+async def test_edge_scan_is_not_limited_to_node_edge_schema(legacy_result):
+    surviving = ("a", "b", "made from", {})
+    missing = ("b", "c", "contains", {})
+    rows = [["a", "b", "made from"]]
+    graph = SimpleNamespace(
+        query=AsyncMock(return_value=(SimpleNamespace(result_set=rows) if legacy_result else rows))
+    )
+    assert await _edges_needing_reassert(graph, [surviving, missing]) == [missing]
+    query = graph.query.call_args.args[0]
+    assert "MATCH (a)-[r]->(b)" in query
+    assert "coalesce(r.relationship_name, type(r))" in query
+
+
+@pytest.mark.asyncio
+async def test_edge_scan_failure_reasserts_all():
+    graph = SimpleNamespace(query=AsyncMock(side_effect=RuntimeError("unsupported query")))
+    edges = [("a", "b", "contains", {})]
+    assert await _edges_needing_reassert(graph, edges) == edges
 
 
 class _Graph:
