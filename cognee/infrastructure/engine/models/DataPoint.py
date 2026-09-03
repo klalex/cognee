@@ -1,3 +1,4 @@
+import json
 import logging
 from datetime import datetime, timezone
 from typing import Any
@@ -209,6 +210,27 @@ class DataPoint(BaseModel):
                 new_metadata["identity_fields"] = dedup_fields
             cls.model_fields["metadata"].default = new_metadata
 
+    @staticmethod
+    def _metadata_index_fields(data_point: Any) -> list[str]:
+        """Return ``index_fields`` from a DataPoint or graph-node carrier.
+
+        FalkorDB (and some other graph adapters) JSON-encode dict-valued node
+        properties such as ``metadata`` on write. Round-tripped nodes therefore
+        carry ``metadata`` as a string until it is parsed again.
+        """
+        metadata = getattr(data_point, "metadata", None)
+        if isinstance(metadata, str):
+            try:
+                metadata = json.loads(metadata)
+            except (json.JSONDecodeError, TypeError):
+                metadata = {}
+        if not isinstance(metadata, dict):
+            return []
+        index_fields = metadata.get("index_fields")
+        if not index_fields:
+            return []
+        return list(index_fields)
+
     @classmethod
     def get_embeddable_data(cls, data_point: "DataPoint") -> Any | None:
         """
@@ -229,12 +251,9 @@ class DataPoint(BaseModel):
 
             The value of the embeddable data, or None if not found.
         """
-        if (
-            data_point.metadata
-            and len(data_point.metadata["index_fields"]) > 0
-            and hasattr(data_point, data_point.metadata["index_fields"][0])
-        ):
-            attribute = getattr(data_point, data_point.metadata["index_fields"][0])
+        index_fields = cls._metadata_index_fields(data_point)
+        if index_fields and hasattr(data_point, index_fields[0]):
+            attribute = getattr(data_point, index_fields[0])
 
             if isinstance(attribute, str):
                 return attribute.strip()
@@ -259,10 +278,9 @@ class DataPoint(BaseModel):
 
             A list of embeddable property values, or an empty list if none exist.
         """
-        if data_point.metadata and len(data_point.metadata["index_fields"]) > 0:
-            return [
-                getattr(data_point, field, None) for field in data_point.metadata["index_fields"]
-            ]
+        index_fields = cls._metadata_index_fields(data_point)
+        if index_fields:
+            return [getattr(data_point, field, None) for field in index_fields]
 
         return []
 
@@ -285,7 +303,7 @@ class DataPoint(BaseModel):
             A list of property names corresponding to the index fields, or an empty list if none
             exist.
         """
-        return data_point.metadata["index_fields"] or []
+        return cls._metadata_index_fields(data_point)
 
     def update_version(self) -> None:
         """

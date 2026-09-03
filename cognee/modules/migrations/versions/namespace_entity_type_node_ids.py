@@ -120,6 +120,7 @@ Caveats:
   and every dataset is migrated in the same run.
 """
 
+import json
 import logging
 from uuid import NAMESPACE_OID, UUID, uuid5
 
@@ -221,8 +222,21 @@ def _frozen_node_pk(tenant_id, user_id, dataset_id, data_id, slug) -> UUID:
 _carrier_classes: dict = {}
 
 
+def _normalize_graph_node_properties(properties: dict) -> dict:
+    """Restore dict-valued properties that graph adapters JSON-encode on write."""
+    props = dict(properties)
+    metadata = props.get("metadata")
+    if isinstance(metadata, str):
+        try:
+            props["metadata"] = json.loads(metadata)
+        except (json.JSONDecodeError, TypeError):
+            pass
+    return props
+
+
 def _make_node(properties: dict):
     """Return a graph-node carrier (id + all properties) accepted by any adapter."""
+    properties = _normalize_graph_node_properties(properties)
     node_type = properties.get("type") or "Node"
     carrier_cls = _carrier_classes.get(node_type)
     if carrier_cls is None:
