@@ -36,7 +36,9 @@ serviceAccount:
   name: ""
   automountServiceAccountToken: false
 
-podSecurityContext: {}
+podSecurityContext:
+  fsGroup: 1000
+  fsGroupChangePolicy: OnRootMismatch
 
 securityContext:
   allowPrivilegeEscalation: false
