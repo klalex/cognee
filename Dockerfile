@@ -46,7 +46,7 @@ RUN --mount=type=cache,target=/root/.cache/uv \
     for extra in ${COGNEE_EXTRAS}; do \
         set -- "$@" --extra "$extra"; \
     done; \
-    uv sync "$@" --extra docling --extra docling-full --extra fastembed --extra debug --extra api --extra postgres --extra neo4j --extra falkor --extra tracing --extra monitoring --extra llama-index --extra aws --extra ollama --extra mistral --extra groq --extra anthropic --frozen --no-install-project --no-dev --no-editable
+    uv sync "$@" --extra docling --extra docling-full --extra docs --extra fastembed --extra debug --extra api --extra postgres --extra neo4j --extra falkor --extra tracing --extra monitoring --extra llama-index --extra aws --extra ollama --extra mistral --extra groq --extra anthropic --frozen --no-install-project --no-dev --no-editable
 
 # Then, add the rest of the project source code and install it
 # Installing separately from its dependencies allows optimal layer caching
@@ -63,7 +63,7 @@ RUN --mount=type=cache,target=/root/.cache/uv \
     for extra in ${COGNEE_EXTRAS}; do \
         set -- "$@" --extra "$extra"; \
     done; \
-    uv sync "$@" --extra docling --extra docling-full --extra fastembed --extra debug --extra api --extra postgres --extra neo4j --extra falkor --extra tracing --extra monitoring --extra llama-index --extra aws --extra ollama --extra mistral --extra groq --extra anthropic --frozen --no-dev --no-editable
+    uv sync "$@" --extra docling --extra docling-full --extra docs --extra fastembed --extra debug --extra api --extra postgres --extra neo4j --extra falkor --extra tracing --extra monitoring --extra llama-index --extra aws --extra ollama --extra mistral --extra groq --extra anthropic --frozen --no-dev --no-editable
 
 FROM python:3.12-slim-bookworm
 
