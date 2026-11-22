@@ -108,6 +108,8 @@ FROM python:3.12-slim-bookworm@sha256:782412e85d0f0984994c290652577d4018aff08145
 # ca-certificates: the base is pinned by digest, so its CA bundle is frozen at
 # that image; installing it here pulls bookworm-security's current one (the
 # eMudhra revocation, ENG-28, shipped as 20250419~deb12u2).
+# pandoc: required by the unstructured docs loader (pypandoc) for formats like
+# docx/odt/rtf/epub. Without it, remember()/add() fails with "No pandoc was found".
 RUN apt-get update && apt-get install -y \
     libpq5 \
     libgl1 \
@@ -115,6 +117,7 @@ RUN apt-get update && apt-get install -y \
     curl \
     git \
     ca-certificates \
+    pandoc \
     && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app
