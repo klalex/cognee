@@ -22,6 +22,7 @@ FALKOR_REGISTER_MODULES = (
 
 def _try_load_falkor_adapter() -> None:
     from cognee.infrastructure.databases.hybrid.falkor.compat import (
+        patch_falkor_adapter_filtered_graph_data,
         patch_falkor_adapter_graph_data,
         patch_falkor_adapter_provenance_kwargs,
     )
@@ -45,6 +46,7 @@ def _try_load_falkor_adapter() -> None:
 
     patch_falkor_adapter_provenance_kwargs()
     patch_falkor_adapter_graph_data()
+    patch_falkor_adapter_filtered_graph_data()
 
 
 def _get_create_vector_engine_optional_defaults() -> dict:

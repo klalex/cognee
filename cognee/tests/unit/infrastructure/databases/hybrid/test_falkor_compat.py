@@ -118,3 +118,27 @@ async def test_graph_reader_uses_logical_topology_and_preserves_properties(
 async def test_graph_reader_empty_graph():
     adapter = SimpleNamespace(query=AsyncMock(side_effect=[[], []]))
     assert await compat._get_graph_data(adapter) == ([], [])
+
+
+@pytest.mark.asyncio
+async def test_filtered_graph_data_accepts_include_edges(monkeypatch):
+    class LegacyAdapter:
+        async def get_filtered_graph_data(self, attribute_filters):
+            return (["node"], [("a", "b", "R", {})])
+
+    child = types.ModuleType("cognee_community_hybrid_adapter_falkor.falkor_adapter")
+    child.FalkorDBAdapter = LegacyAdapter
+    monkeypatch.setitem(sys.modules, child.__name__, child)
+    monkeypatch.setattr(compat, "_FILTERED_GRAPH_DATA_PATCHED", False)
+
+    compat.patch_falkor_adapter_filtered_graph_data()
+
+    adapter = LegacyAdapter()
+    nodes, edges = await adapter.get_filtered_graph_data(
+        [{"type": ["FactConflict"]}], include_edges=False
+    )
+    assert nodes == ["node"]
+    assert edges == []
+
+    nodes, edges = await adapter.get_filtered_graph_data([{"type": ["FactConflict"]}])
+    assert edges == [("a", "b", "R", {})]

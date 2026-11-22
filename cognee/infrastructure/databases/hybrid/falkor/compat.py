@@ -6,6 +6,7 @@ import inspect
 from typing import Callable
 
 _PROVENANCE_KWARGS_PATCHED = False
+_FILTERED_GRAPH_DATA_PATCHED = False
 
 
 def patch_falkor_adapter_graph_data() -> None:
@@ -78,6 +79,53 @@ def patch_falkor_adapter_provenance_kwargs() -> None:
 def _wrap_ignore_provenance_kwargs(original: Callable):
     async def wrapped(self, items, source_ref_key=None, pipeline_run_id=None):
         return await original(self, items)
+
+    wrapped.__name__ = getattr(original, "__name__", "wrapped")
+    wrapped.__doc__ = getattr(original, "__doc__", None)
+    return wrapped
+
+
+def patch_falkor_adapter_filtered_graph_data() -> None:
+    """Accept ``include_edges`` on older community Falkor ``get_filtered_graph_data``.
+
+    Cognee's GraphDBInterface added a keyword-only ``include_edges`` flag so
+    callers can skip the edge query (e.g. conflict resolution only needs
+    ``FactConflict`` nodes). Older community Falkor adapters reject that kwarg
+    with ``TypeError``. Accept it here until the adapter catches up; when
+    ``include_edges`` is False, drop the edge half of the result.
+    """
+    global _FILTERED_GRAPH_DATA_PATCHED
+    if _FILTERED_GRAPH_DATA_PATCHED:
+        return
+
+    try:
+        from cognee_community_hybrid_adapter_falkor.falkor_adapter import FalkorDBAdapter
+    except Exception:
+        return
+
+    original = getattr(FalkorDBAdapter, "get_filtered_graph_data", None)
+    if original is None:
+        return
+
+    try:
+        signature = inspect.signature(original)
+    except (TypeError, ValueError):
+        return
+
+    if "include_edges" in signature.parameters:
+        _FILTERED_GRAPH_DATA_PATCHED = True
+        return
+
+    setattr(FalkorDBAdapter, "get_filtered_graph_data", _wrap_include_edges(original))
+    _FILTERED_GRAPH_DATA_PATCHED = True
+
+
+def _wrap_include_edges(original: Callable):
+    async def wrapped(self, attribute_filters, *, include_edges: bool = True):
+        nodes, edges = await original(self, attribute_filters)
+        if include_edges:
+            return nodes, edges
+        return nodes, []
 
     wrapped.__name__ = getattr(original, "__name__", "wrapped")
     wrapped.__doc__ = getattr(original, "__doc__", None)
