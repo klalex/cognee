@@ -142,3 +142,39 @@ async def test_filtered_graph_data_accepts_include_edges(monkeypatch):
 
     nodes, edges = await adapter.get_filtered_graph_data([{"type": ["FactConflict"]}])
     assert edges == [("a", "b", "R", {})]
+
+
+@pytest.mark.asyncio
+async def test_retrieve_wraps_falkor_node_rows_as_scored_results(monkeypatch):
+    class Node:
+        def __init__(self, properties):
+            self.properties = properties
+
+    class LegacyAdapter:
+        async def retrieve(self, collection_name, data_point_ids):
+            return [
+                [Node({"id": "3d789d76-638a-5e88-beb1-59e34e1486b4", "text": "chunk"})],
+                [Node({"text": "missing id"})],
+            ]
+
+    child = types.ModuleType("cognee_community_hybrid_adapter_falkor.falkor_adapter")
+    child.FalkorDBAdapter = LegacyAdapter
+    monkeypatch.setitem(sys.modules, child.__name__, child)
+    monkeypatch.setattr(compat, "_RETRIEVE_PATCHED", False)
+
+    compat.patch_falkor_adapter_retrieve()
+    compat.patch_falkor_adapter_retrieve()
+
+    rows = await LegacyAdapter().retrieve(
+        "DocumentChunk_text",
+        ["3d789d76-638a-5e88-beb1-59e34e1486b4"],
+    )
+    assert len(rows) == 1
+    assert str(rows[0].id) == "3d789d76-638a-5e88-beb1-59e34e1486b4"
+    assert rows[0].payload["text"] == "chunk"
+
+
+@pytest.mark.asyncio
+async def test_retrieve_leaves_scored_rows_unchanged():
+    scored = SimpleNamespace(id="already-scored", payload={"text": "kept"})
+    assert compat._scored_retrieve_rows([scored, []]) == [scored]

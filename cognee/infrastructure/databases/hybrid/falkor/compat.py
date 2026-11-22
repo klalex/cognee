@@ -7,6 +7,7 @@ from typing import Callable
 
 _PROVENANCE_KWARGS_PATCHED = False
 _FILTERED_GRAPH_DATA_PATCHED = False
+_RETRIEVE_PATCHED = False
 
 
 def patch_falkor_adapter_graph_data() -> None:
@@ -118,6 +119,76 @@ def patch_falkor_adapter_filtered_graph_data() -> None:
 
     setattr(FalkorDBAdapter, "get_filtered_graph_data", _wrap_include_edges(original))
     _FILTERED_GRAPH_DATA_PATCHED = True
+
+
+def patch_falkor_adapter_retrieve() -> None:
+    """Return vector lookup rows as scored results, not raw Falkor result rows.
+
+    ``FalkorDBAdapter.retrieve`` hands back ``QueryResult.result_set``. Each
+    row is a list whose first cell is the node, so ``row.id`` raises
+    ``AttributeError: 'list' object has no attribute 'id'``. Cognify hits
+    that in ``find_indexed_chunks`` after the indexing pass, and the remember
+    run fails before entity extraction. Other vector adapters return
+    ``ScoredResult``. Wrap the community method until it does too. Rows that
+    already have ``id`` pass through, so a fixed adapter is left alone.
+    """
+    global _RETRIEVE_PATCHED
+    if _RETRIEVE_PATCHED:
+        return
+
+    try:
+        from cognee_community_hybrid_adapter_falkor.falkor_adapter import FalkorDBAdapter
+    except Exception:
+        return
+
+    original = getattr(FalkorDBAdapter, "retrieve", None)
+    if original is None:
+        return
+
+    setattr(FalkorDBAdapter, "retrieve", _wrap_retrieve(original))
+    _RETRIEVE_PATCHED = True
+
+
+def _node_properties(cell) -> dict:
+    properties = getattr(cell, "properties", None)
+    if isinstance(properties, dict):
+        return dict(properties)
+    if isinstance(cell, dict):
+        return dict(cell)
+    return {}
+
+
+def _scored_retrieve_rows(rows):
+    from cognee.infrastructure.databases.vector.models.ScoredResult import ScoredResult
+    from cognee.infrastructure.engine.utils.parse_id import parse_id
+
+    if not rows:
+        return []
+
+    scored = []
+    for row in rows:
+        if not isinstance(row, (list, tuple)):
+            scored.append(row)
+            continue
+        cell = row[0] if row else None
+        payload = _node_properties(cell)
+        node_id = payload.get("id")
+        if node_id is None and cell is not None:
+            node_id = getattr(cell, "id", None)
+        if node_id is None:
+            continue
+        scored.append(ScoredResult(id=parse_id(node_id), payload=payload, score=0))
+    return scored
+
+
+def _wrap_retrieve(original: Callable):
+    async def wrapped(self, collection_name, data_point_ids, *args, **kwargs):
+        rows = await original(self, collection_name, data_point_ids, *args, **kwargs)
+        return _scored_retrieve_rows(rows)
+
+    wrapped.__name__ = getattr(original, "__name__", "wrapped")
+    wrapped.__doc__ = getattr(original, "__doc__", None)
+    return wrapped
 
 
 def _wrap_include_edges(original: Callable):

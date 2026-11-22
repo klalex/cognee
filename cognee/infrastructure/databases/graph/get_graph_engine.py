@@ -33,6 +33,7 @@ def _try_load_falkor_adapter() -> None:
         patch_falkor_adapter_filtered_graph_data,
         patch_falkor_adapter_graph_data,
         patch_falkor_adapter_provenance_kwargs,
+        patch_falkor_adapter_retrieve,
     )
 
     if "falkor" not in supported_databases and "falkordb" not in supported_databases:
@@ -55,6 +56,7 @@ def _try_load_falkor_adapter() -> None:
     patch_falkor_adapter_provenance_kwargs()
     patch_falkor_adapter_graph_data()
     patch_falkor_adapter_filtered_graph_data()
+    patch_falkor_adapter_retrieve()
 
 
 def _get_create_graph_engine_optional_defaults() -> dict:
