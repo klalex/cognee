@@ -1,13 +1,14 @@
-import hashlib
 from dataclasses import dataclass
-from typing import BinaryIO, Optional, Union
+from typing import BinaryIO
 
 from cognee.infrastructure.files.storage import get_file_storage, get_storage_config
+from cognee.infrastructure.files.stored_file_claims import claim_stored_file, removals_so_far
 
 # ``_derive_basename`` is the one place that turns a path/URI into the
 # extension-less document name stored on ``Data.name``. Reusing it here keeps
 # the name identical to the one the old read-it-back-from-storage path produced.
 from cognee.infrastructure.files.utils.get_file_metadata import FileMetadata, _derive_basename
+from cognee.modules.data.content_hash import compute_content_hash
 
 from .classify import classify
 from .data_types import TextData
@@ -25,10 +26,10 @@ class StoredFile:
     """
 
     file_path: str
-    metadata: Optional[FileMetadata] = None
+    metadata: FileMetadata | None = None
 
 
-def _storage_key(file_name: str, content_hash: Optional[str], is_text: bool) -> str:
+def _storage_key(file_name: str, content_hash: str | None, is_text: bool) -> str:
     """The object key a payload is stored under: ``<content-md5>/<filename>``.
 
     Keying on the caller's filename alone meant two different uploads that
@@ -53,9 +54,9 @@ def _storage_key(file_name: str, content_hash: Optional[str], is_text: bool) -> 
 
 
 async def save_data_to_file_detailed(
-    data: Union[str, BinaryIO],
-    filename: str = None,
-    file_extension: Optional[str] = None,
+    data: str | BinaryIO,
+    filename: str | None = None,
+    file_extension: str | None = None,
 ) -> StoredFile:
     """Save ``data`` to cognee storage and describe what was saved.
 
@@ -74,9 +75,7 @@ async def save_data_to_file_detailed(
 
     async with classified_data.get_data() as payload:
         if "name" not in file_metadata or file_metadata["name"] is None:
-            data_contents = payload.encode("utf-8")
-            hash_contents = hashlib.md5(data_contents).hexdigest()
-            file_metadata["name"] = "text_" + hash_contents + ".txt"
+            file_metadata["name"] = "text_" + compute_content_hash(payload) + ".txt"
 
         file_name = file_metadata["name"]
 
@@ -86,11 +85,16 @@ async def save_data_to_file_detailed(
             file_name = f"{file_name_without_ext}.{extension}"
 
         storage = get_file_storage(data_root_directory)
+        storage_key = _storage_key(file_name, file_metadata.get("content_hash"), is_text)
 
-        full_file_path = await storage.store(
-            _storage_key(file_name, file_metadata.get("content_hash"), is_text),
-            payload,
-            overwrite=True,
+        removals_before_store = removals_so_far()
+        full_file_path = await storage.store(storage_key, payload, overwrite=True)
+        # The key is shared by every add of these bytes, so the file is claimed
+        # until the caller's row points at it (see ``stored_file_claims``).
+        await claim_stored_file(
+            full_file_path,
+            removals_before_store,
+            lambda: storage.store(storage_key, payload, overwrite=True),
         )
 
     # Point the metadata at where the payload actually landed, and carry the
@@ -104,7 +108,7 @@ async def save_data_to_file_detailed(
 
 
 async def save_data_to_file(
-    data: Union[str, BinaryIO], filename: str = None, file_extension: Optional[str] = None
+    data: str | BinaryIO, filename: str | None = None, file_extension: str | None = None
 ) -> str:
     """Save ``data`` to cognee storage and return its path.
 

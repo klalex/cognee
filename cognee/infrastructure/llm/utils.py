@@ -1,9 +1,8 @@
 import asyncio
 import os
 
-import litellm
-
 from cognee.infrastructure.llm.LLMGateway import LLMGateway
+from cognee.infrastructure.llm.tokenizer.TikToken import TikTokenTokenizer
 from cognee.shared.logging_utils import get_logger
 
 logger = get_logger()
@@ -28,32 +27,77 @@ async def get_max_chunk_tokens() -> int:
     """
     # NOTE: Import must be done in function to avoid circular import issue
     from cognee.infrastructure.databases.vector import get_vector_engine_async
-    from cognee.infrastructure.llm.config import get_llm_context_config
+    from cognee.infrastructure.databases.vector.embeddings.input_limit import (
+        resolve_input_limit,
+    )
 
     # Calculate max chunk size based on the following formula
     embedding_engine = (await get_vector_engine_async()).embedding_engine
-
-    # Resolve the LLM token ceiling from configuration alone — building an LLM
-    # client here would eagerly instantiate the (legacy) instructor adapter
-    # even when the litellm_native framework is active. Mirrors the resolution
-    # in get_llm_client()/get_native_client(): the lower of the model's hard
-    # limit and the user's configured ceiling, with the Ollama context-size
-    # special case.
-    llm_config = get_llm_context_config()
-    model_max = get_model_max_completion_tokens(llm_config.llm_model)
-    if model_max is not None:
-        llm_max_completion_tokens = min(model_max, llm_config.llm_max_completion_tokens)
-    elif llm_config.llm_provider == "ollama":
-        llm_max_completion_tokens = llm_config.ollama_num_ctx
-    else:
-        llm_max_completion_tokens = llm_config.llm_max_completion_tokens
+    await resolve_input_limit(embedding_engine)
 
     # We need to make sure chunk size won't take more than half of LLM max context token size
     # but it also can't be bigger than the embedding engine max token size
-    llm_cutoff_point = llm_max_completion_tokens // 2  # Round down the division
+    llm_cutoff_point = get_llm_token_ceiling() // 2
     max_chunk_tokens = min(embedding_engine.max_completion_tokens, llm_cutoff_point)
 
     return max_chunk_tokens
+
+
+# (chunk_size, limit) pairs already warned about: a pipeline resolves the size in
+# more than one place, and one warning per process says everything the next would.
+_chunk_size_warnings_issued: set[tuple[int, int]] = set()
+
+
+async def resolve_chunk_size(chunk_size: int | None) -> int:
+    """The chunk size a pipeline runs with: the caller's, capped at what can be embedded.
+
+    ``None`` (or 0) means the automatic size from :func:`get_max_chunk_tokens`. An
+    explicit value is kept unless it exceeds the embedding engine's token limit --
+    the model's own input limit, or ``EMBEDDING_MAX_COMPLETION_TOKENS`` when that
+    is lower -- in which case it is lowered to that limit with a warning: text past
+    the limit would be dropped from the embedding, or rejected by the provider.
+    The LLM half-context rule only applies to the automatic size.
+    """
+    if not chunk_size:
+        return await get_max_chunk_tokens()
+    if chunk_size < 0:
+        raise ValueError(f"chunk_size must be a positive number of tokens, got {chunk_size}")
+
+    from cognee.infrastructure.databases.vector import get_vector_engine_async
+    from cognee.infrastructure.databases.vector.embeddings.input_limit import (
+        resolve_input_limit,
+    )
+
+    embedding_engine = (await get_vector_engine_async()).embedding_engine
+    limit = await resolve_input_limit(embedding_engine)
+    if chunk_size <= limit:
+        return chunk_size
+
+    model_limit = embedding_engine.model_input_limit
+    if (chunk_size, limit) in _chunk_size_warnings_issued:
+        return limit
+    _chunk_size_warnings_issued.add((chunk_size, limit))
+    if limit == model_limit:
+        logger.warning(
+            "chunk_size=%s exceeds what embedding model %r accepts (%s tokens of text); using %s. "
+            "Text beyond the model's limit would be dropped from the embedding.",
+            chunk_size,
+            embedding_engine.model,
+            model_limit,
+            limit,
+        )
+    else:
+        logger.warning(
+            "chunk_size=%s exceeds EMBEDDING_MAX_COMPLETION_TOKENS (%s); using %s. Raise "
+            "EMBEDDING_MAX_COMPLETION_TOKENS to allow larger chunks%s.",
+            chunk_size,
+            limit,
+            limit,
+            f" (embedding model {embedding_engine.model!r} accepts up to {model_limit} tokens of text)"
+            if model_limit is not None
+            else "",
+        )
+    return limit
 
 
 def get_model_max_completion_tokens(model_name: str) -> int | None:
@@ -74,6 +118,10 @@ def get_model_max_completion_tokens(model_name: str) -> int | None:
 
         Number of max tokens of model, or None if model is unknown
     """
+    # Imported here, not at module scope: this module is on the ``import cognee``
+    # path and litellm (with the OpenAI SDK behind it) is half of that import.
+    import litellm
+
     max_completion_tokens: int | None = None
 
     if model_name in litellm.model_cost:
@@ -90,20 +138,61 @@ def get_model_max_completion_tokens(model_name: str) -> int | None:
     return max_completion_tokens
 
 
+def get_llm_token_ceiling() -> int:
+    """The LLM token ceiling, resolved from configuration alone.
+
+    Building an LLM client here would eagerly instantiate the legacy framework's
+    adapter even when the litellm_native framework is active. Mirrors the
+    resolution in get_llm_client()/get_native_client(): the lower of the model's
+    hard limit and the user's configured ceiling, with the Ollama context-size
+    special case.
+    """
+    # NOTE: Import must be done in function to avoid circular import issue
+    from cognee.infrastructure.llm.config import get_llm_context_config
+
+    config = get_llm_context_config()
+    model_max = get_model_max_completion_tokens(config.llm_model)
+    if model_max is not None:
+        return min(model_max, config.llm_max_completion_tokens)
+    if config.llm_provider == "ollama":
+        return config.ollama_num_ctx
+    return config.llm_max_completion_tokens
+
+
+def get_llm_tokenizer() -> TikTokenTokenizer:
+    """Use the model's encoding, or the default for models unknown to tiktoken."""
+    # NOTE: Import must be done in function to avoid circular import issue
+    from cognee.infrastructure.llm.config import get_llm_config
+
+    model = get_llm_config().llm_model.split("/", 1)[-1]
+    try:
+        return TikTokenTokenizer(model=model)
+    except Exception:
+        logger.debug("Falling back to the default LLM tokenizer", exc_info=True)
+        return TikTokenTokenizer(model=None)
+
+
 async def test_llm_connection() -> None:
     """
     Test connectivity to the LLM endpoint using a simple completion call.
     """
+    from litellm.exceptions import AuthenticationError
+
+    # Imported here: this module loads during cognee's startup, before the
+    # context variables caller_scope depends on can be imported.
+    from cognee.infrastructure.llm.pipeline_stage import caller_scope
+
     try:
         logger.info("Testing connection to LLM endpoint...")
-        await asyncio.wait_for(
-            LLMGateway.acreate_structured_output(
-                text_input="test",
-                system_prompt='Respond to me with the following string: "test"',
-                response_model=str,
-            ),
-            timeout=CONNECTION_TEST_TIMEOUT_SECONDS,
-        )
+        with caller_scope("test_llm_connection"):
+            await asyncio.wait_for(
+                LLMGateway.acreate_structured_output(
+                    text_input="test",
+                    system_prompt='Respond to me with the following string: "test"',
+                    response_model=str,
+                ),
+                timeout=CONNECTION_TEST_TIMEOUT_SECONDS,
+            )
     except asyncio.TimeoutError:
         msg = (
             f"LLM connection test timed out after {CONNECTION_TEST_TIMEOUT_SECONDS}s. "
@@ -112,17 +201,17 @@ async def test_llm_connection() -> None:
         )
         logger.error(msg)
         raise TimeoutError(msg)
-    except litellm.exceptions.AuthenticationError as e:
+    except AuthenticationError:
         msg = (
             "LLM authentication failed. Check your LLM_API_KEY configuration. "
             "Set COGNEE_SKIP_CONNECTION_TEST=true to bypass this check."
         )
         logger.error(msg)
-        raise e
+        raise
     except Exception as e:
         logger.error(e)
         logger.error("Connection to LLM could not be established.")
-        raise e
+        raise
 
 
 async def test_embedding_connection() -> int:
@@ -137,9 +226,15 @@ async def test_embedding_connection() -> int:
     try:
         # NOTE: Vector engine import must be done in function to avoid circular import issue
         from cognee.infrastructure.databases.vector import get_vector_engine_async
+        from cognee.infrastructure.databases.vector.embeddings.input_limit import (
+            resolve_input_limit,
+        )
 
         logger.info("Testing connection to Embedding endpoint...")
         vector_engine = await get_vector_engine_async()
+        # Learn the model's input limit up front, so its log line appears at
+        # startup and the first chunk-size resolution finds it ready.
+        await resolve_input_limit(vector_engine.embedding_engine)
         embedding_vectors = await asyncio.wait_for(
             vector_engine.embedding_engine.embed_text(["test"]),
             timeout=CONNECTION_TEST_TIMEOUT_SECONDS,
@@ -160,7 +255,7 @@ async def test_embedding_connection() -> int:
     except Exception as e:
         logger.error(e)
         logger.error("Connection to Embedding handler could not be established.")
-        raise e
+        raise
 
 
 async def determine_embedding_dimensions(detected_dimensions: int) -> None:
@@ -180,6 +275,14 @@ async def determine_embedding_dimensions(detected_dimensions: int) -> None:
     from cognee.infrastructure.databases.vector.embeddings.config import get_embedding_config
 
     embedding_config = get_embedding_config()
+    if embedding_config.embedding_dimensions is None:
+        embedding_engine = (await get_vector_engine_async()).embedding_engine
+        if hasattr(embedding_engine, "configured_dimensions"):
+            # The engine learns its vector size itself (embedding_worker) and
+            # already holds it. Writing it into the config would make the next
+            # get_embedding_engine() build a second engine (it is cached by its
+            # arguments) that takes the learned size for EMBEDDING_DIMENSIONS.
+            return
     if embedding_config.embedding_dimensions != detected_dimensions:
         embedding_config.embedding_dimensions = detected_dimensions
 

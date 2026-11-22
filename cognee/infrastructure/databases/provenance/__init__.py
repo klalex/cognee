@@ -8,11 +8,16 @@ from .constants import (
 )
 from .delete_data import EdgeDeleteData, EdgeIdentity, NodeDeleteData
 from .source_refs import (
+    data_source_ref_key_selector,
     get_data_id_from_source_ref_key,
     get_dataset_id_from_source_ref_key,
     get_pipeline_run_id_from_source_run_ref,
     get_source_ref_key_from_source_run_ref,
+    make_chunk_source_ref_key,
+    make_chunk_source_ref_key_prefix,
     make_source_ref_key,
+    parse_source_ref_key,
+    ParsedSourceRef,
     make_source_run_ref,
 )
 from .write_context import (
@@ -31,13 +36,18 @@ __all__ = [
     "EdgeDeleteData",
     "EdgeIdentity",
     "NodeDeleteData",
+    "ParsedSourceRef",
+    "data_item_id",
+    "data_source_ref_key_selector",
     "get_data_id_from_source_ref_key",
     "get_dataset_id_from_source_ref_key",
     "get_pipeline_run_id_from_source_run_ref",
     "get_source_ref_key_from_source_run_ref",
+    "graph_provenance_write_kwargs",
+    "make_chunk_source_ref_key",
+    "make_chunk_source_ref_key_prefix",
     "make_source_ref_key",
     "make_source_run_ref",
-    "data_item_id",
-    "graph_provenance_write_kwargs",
+    "parse_source_ref_key",
     "source_ref_from_context",
 ]

@@ -1,5 +1,6 @@
+from unittest.mock import AsyncMock, MagicMock, call, patch
+
 import pytest
-from unittest.mock import AsyncMock, MagicMock, patch, call
 
 from cognee.modules.graph.cognee_graph.CogneeGraphElements import Edge
 from cognee.modules.retrieval.exceptions.exceptions import QueryValidationError
@@ -88,8 +89,29 @@ def test_normalize_subqueries_strips_caps_and_falls_back():
     assert fallback == ["Original query"]
 
 
+def test_an_empty_plan_is_logged_as_a_warning(caplog):
+    with caplog.at_level("WARNING"):
+        assert normalize_subqueries("Original query", ["", "   "]) == ["Original query"]
+        assert normalize_subqueries("Original query", []) == ["Original query"]
+    assert caplog.text.count("returned no usable subquery") == 2
+
+
+def test_a_usable_plan_logs_no_warning(caplog):
+    with caplog.at_level("WARNING"):
+        normalize_subqueries("Original query", ["First query"])
+    assert "returned no usable subquery" not in caplog.text
+
+
+def test_normalize_subqueries_honours_max_subqueries():
+    nine = [f"subquery {index}" for index in range(9)]
+
+    assert normalize_subqueries("original", nine) == nine[:5]  # default unchanged
+    assert normalize_subqueries("original", nine, max_subqueries=7) == nine[:7]
+    assert normalize_subqueries("original", nine, max_subqueries=1) == nine[:1]
+
+
 @pytest.mark.asyncio
-async def test_decompose_query_falls_back_to_original_query_on_failure():
+async def test_decompose_query_propagates_a_planning_failure():
     retriever = GraphCompletionDecompositionRetriever()
 
     with (
@@ -98,14 +120,13 @@ async def test_decompose_query_falls_back_to_original_query_on_failure():
             return_value="Decomposition prompt",
         ),
         patch(
-            "cognee.modules.retrieval.graph_completion_decomposition_retriever.LLMGateway.acreate_structured_output",
+            "cognee.modules.retrieval.utils.query_decomposition.LLMGateway.acreate_structured_output",
             new_callable=AsyncMock,
             side_effect=RuntimeError("LLM unavailable"),
         ),
+        pytest.raises(RuntimeError, match="LLM unavailable"),
     ):
-        subqueries = await retriever._decompose_query("Original query")
-
-    assert subqueries == ["Original query"]
+        await retriever._decompose_query("Original query")
 
 
 @pytest.mark.asyncio
@@ -118,7 +139,7 @@ async def test_decompose_query_returns_normalized_subqueries_on_success():
             return_value="Decomposition prompt",
         ),
         patch(
-            "cognee.modules.retrieval.graph_completion_decomposition_retriever.LLMGateway.acreate_structured_output",
+            "cognee.modules.retrieval.utils.query_decomposition.LLMGateway.acreate_structured_output",
             new_callable=AsyncMock,
             return_value=QueryDecomposition(
                 subqueries=["  First query  ", "", "First query", "Second query"]
@@ -131,16 +152,24 @@ async def test_decompose_query_returns_normalized_subqueries_on_success():
 
 
 @pytest.mark.asyncio
-async def test_decompose_query_falls_back_to_original_query_when_prompt_missing():
+@pytest.mark.parametrize("missing", ["", None])
+async def test_decompose_query_raises_when_the_prompt_is_missing(missing):
     retriever = GraphCompletionDecompositionRetriever()
 
-    with patch(
-        "cognee.modules.retrieval.graph_completion_decomposition_retriever.read_query_prompt",
-        return_value="",
+    with (
+        patch(
+            "cognee.modules.retrieval.graph_completion_decomposition_retriever.read_query_prompt",
+            return_value=missing,
+        ),
+        patch(
+            "cognee.modules.retrieval.utils.query_decomposition.LLMGateway.acreate_structured_output",
+            new_callable=AsyncMock,
+        ) as llm,
+        pytest.raises(ValueError, match="needs a system prompt"),
     ):
-        subqueries = await retriever._decompose_query("Original query")
+        await retriever._decompose_query("Original query")
 
-    assert subqueries == ["Original query"]
+    llm.assert_not_awaited()
 
 
 @pytest.mark.asyncio
@@ -515,24 +544,24 @@ async def test_combined_mode_internal_batch_does_not_fail_with_session_cache():
 
 @pytest.mark.asyncio
 async def test_get_retrieved_objects_and_context_handle_empty_graph():
+    """An empty graph is a loud state error (NoDataError -> 404 over the API),
+    not a quiet miss (SDK-270 / gh #3728)."""
+    from cognee.modules.retrieval.exceptions.exceptions import NoDataError
+
     retriever = GraphCompletionDecompositionRetriever()
 
     mock_graph_engine = AsyncMock()
     mock_graph_engine.is_empty = AsyncMock(return_value=True)
 
-    with patch(
-        "cognee.modules.retrieval.graph_completion_decomposition_retriever.get_unified_engine",
-        new_callable=AsyncMock,
-        return_value=_make_unified_mock(mock_graph_engine),
+    with (
+        patch(
+            "cognee.modules.retrieval.graph_completion_decomposition_retriever.get_unified_engine",
+            new_callable=AsyncMock,
+            return_value=_make_unified_mock(mock_graph_engine),
+        ),
+        pytest.raises(NoDataError, match="knowledge graph is empty"),
     ):
-        objects = await retriever.get_retrieved_objects(query="Original query")
-        context = await retriever.get_context_from_objects(
-            query="Original query",
-            retrieved_objects=objects,
-        )
-
-    assert objects == []
-    assert context == ""
+        await retriever.get_retrieved_objects(query="Original query")
 
 
 @pytest.mark.asyncio
@@ -561,14 +590,16 @@ async def test_ensure_state_raises_for_missing_query():
 async def test_ensure_state_raises_when_retrieval_does_not_initialize_state():
     retriever = GraphCompletionDecompositionRetriever()
 
-    with patch.object(
-        retriever,
-        "get_retrieved_objects",
-        new_callable=AsyncMock,
-        return_value=[],
+    with (
+        patch.object(
+            retriever,
+            "get_retrieved_objects",
+            new_callable=AsyncMock,
+            return_value=[],
+        ),
+        pytest.raises(QueryValidationError, match="Failed to initialize decomposition state"),
     ):
-        with pytest.raises(QueryValidationError, match="Failed to initialize decomposition state"):
-            await retriever._ensure_state("Original query")
+        await retriever._ensure_state("Original query")
 
 
 @pytest.mark.asyncio

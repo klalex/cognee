@@ -1,28 +1,40 @@
-import os
-from urllib.parse import unquote
-import gc
 import asyncio
-from os import path
+import gc
+import os
 import tempfile
-from uuid import UUID
-from typing import Optional
-from typing import AsyncGenerator, List
+from collections.abc import AsyncGenerator
 from contextlib import asynccontextmanager
-from sqlalchemy.orm import joinedload
-from sqlalchemy.exc import NoResultFound
-from sqlalchemy import NullPool, event, text, select, MetaData, Table, delete, inspect, func, or_
-from sqlalchemy.ext.asyncio import AsyncSession, create_async_engine, async_sessionmaker
+from os import path
+from urllib.parse import unquote
+from uuid import UUID
 
-from cognee.modules.data.models.Data import Data
-from cognee.shared.logging_utils import get_logger
-from cognee.infrastructure.utils.run_sync import run_sync
+from sqlalchemy import MetaData, NullPool, Table, delete, event, func, inspect, or_, select, text
+from sqlalchemy.exc import NoResultFound
+from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
+from sqlalchemy.orm import joinedload
+
 from cognee.infrastructure.databases.exceptions import EntityNotFoundError
 from cognee.infrastructure.files.storage import get_file_storage, get_storage_config
+from cognee.infrastructure.files.stored_file_claims import removing_stored_files
+from cognee.infrastructure.utils.run_sync import run_sync
+from cognee.modules.data.models.Data import Data
+from cognee.shared.logging_utils import get_logger
 
 from ..ModelBase import Base
 
-
 logger = get_logger()
+
+
+# Locations per reference query: two IN lists, kept under SQLite's bound-parameter limit.
+_LOCATION_CHUNK = 400
+
+# QueuePool sizing of a server-database engine when POOL_ARGS does not give it.
+DEFAULT_POOL_SIZE = 5
+DEFAULT_MAX_OVERFLOW = 35
+# Seconds a caller waits for a free connection from any of cognee's Postgres pools
+# (relational, graph, both pgvector pools, the Postgres session cache) before the
+# wait raises, when the pool args do not give ``pool_timeout``.
+DEFAULT_POOL_TIMEOUT = 360
 
 
 class SQLAlchemyAdapter:
@@ -31,7 +43,12 @@ class SQLAlchemyAdapter:
     functions.
     """
 
-    def __init__(self, connection_string: str, connect_args: dict = None, pool_args: dict = None):
+    def __init__(
+        self,
+        connection_string: str,
+        connect_args: dict | None = None,
+        pool_args: dict | None = None,
+    ):
         """
         Initialize the SQLAlchemy adapter with connection settings.
 
@@ -109,7 +126,7 @@ class SQLAlchemyAdapter:
             self.engine = create_async_engine(
                 connection_string,
                 **(sqlite_pool_args or {"poolclass": NullPool}),
-                connect_args={**{"timeout": 120}, **final_connect_args},
+                connect_args={"timeout": 120, **final_connect_args},
             )
 
             # SQLite defaults to rollback-journal mode, where a connection that
@@ -123,15 +140,7 @@ class SQLAlchemyAdapter:
             # letting readers proceed, so concurrent writers wait (bounded by
             # busy_timeout) instead of deadlocking. These PRAGMAs are connection
             # scoped, so they must be (re)applied on every new connection.
-            @event.listens_for(self.engine.sync_engine, "connect")
-            def _set_sqlite_pragmas(dbapi_connection, connection_record):
-                cursor = dbapi_connection.cursor()
-                try:
-                    cursor.execute("PRAGMA journal_mode=WAL")
-                    cursor.execute("PRAGMA synchronous=NORMAL")
-                    cursor.execute("PRAGMA busy_timeout=120000")
-                finally:
-                    cursor.close()
+            self._configure_sqlite_engine()
         else:
             # Transform pool_args from tuple into dict if provided
             # Note: For caching purposes, pool_args is stored as a sorted tuple of key-value pairs in the config
@@ -146,11 +155,11 @@ class SQLAlchemyAdapter:
                 # which multiply per dataset under access control — hold few
                 # of the server's max_connections slots between bursts while
                 # keeping a 40-connection burst ceiling.
-                pool_args.setdefault("pool_size", 5)
-                pool_args.setdefault("max_overflow", 35)
+                pool_args.setdefault("pool_size", DEFAULT_POOL_SIZE)
+                pool_args.setdefault("max_overflow", DEFAULT_MAX_OVERFLOW)
                 pool_args.setdefault("pool_pre_ping", True)
                 pool_args.setdefault("pool_recycle", 280)
-                pool_args.setdefault("pool_timeout", 280)
+                pool_args.setdefault("pool_timeout", DEFAULT_POOL_TIMEOUT)
 
             engine_kwargs = {**pool_args}
             if final_connect_args:
@@ -163,12 +172,17 @@ class SQLAlchemyAdapter:
 
         self.sessionmaker = async_sessionmaker(bind=self.engine, expire_on_commit=False)
 
-    async def push_to_s3(self) -> None:
-        if os.getenv("STORAGE_BACKEND", "").lower() == "s3" and hasattr(self, "temp_db_file"):
-            from cognee.infrastructure.files.storage.S3FileStorage import S3FileStorage
+    def needs_push_to_s3(self) -> bool:
+        """Whether writes live in a local copy of an S3 database until ``push_to_s3``."""
+        return os.getenv("STORAGE_BACKEND", "").lower() == "s3" and hasattr(self, "temp_db_file")
 
-            s3_file_storage = S3FileStorage("")
-            s3_file_storage.s3.put(self.temp_db_file, self.db_path, recursive=True)
+    async def push_to_s3(self) -> None:
+        if not self.needs_push_to_s3():
+            return
+        from cognee.infrastructure.files.storage.S3FileStorage import S3FileStorage
+
+        s3_file_storage = S3FileStorage("")
+        s3_file_storage.s3.put(self.temp_db_file, self.db_path, recursive=True)
 
     async def pull_from_s3(self) -> None:
         from cognee.infrastructure.files.storage.S3FileStorage import S3FileStorage
@@ -178,6 +192,24 @@ class SQLAlchemyAdapter:
             s3_file_storage.s3.get(self.db_path, self.temp_db_file, recursive=True)
         except FileNotFoundError:
             pass
+
+    def _configure_sqlite_engine(self) -> None:
+        """Install the per-connection setup of a file-based engine (see ``__init__``).
+
+        SQLite: the WAL/synchronous/busy_timeout PRAGMAs on every new connection.
+        Subclasses for SQLite-compatible engines (Turso) override this with their
+        own engine configuration (journal mode, timeouts, transaction hooks).
+        """
+
+        @event.listens_for(self.engine.sync_engine, "connect")
+        def _set_sqlite_pragmas(dbapi_connection, connection_record):
+            cursor = dbapi_connection.cursor()
+            try:
+                cursor.execute("PRAGMA journal_mode=WAL")
+                cursor.execute("PRAGMA synchronous=NORMAL")
+                cursor.execute("PRAGMA busy_timeout=120000")
+            finally:
+                cursor.close()
 
     @asynccontextmanager
     async def get_async_session(self) -> AsyncGenerator[AsyncSession, None]:
@@ -257,7 +289,7 @@ class SQLAlchemyAdapter:
             )
             await connection.close()
 
-    async def delete_table(self, table_name: str, schema_name: Optional[str] = "public"):
+    async def delete_table(self, table_name: str, schema_name: str | None = "public"):
         """
         Delete a table from the specified schema, if it exists.
 
@@ -282,7 +314,7 @@ class SQLAlchemyAdapter:
         self,
         table_name: str,
         data: list[dict],
-        schema_name: Optional[str] = "public",
+        schema_name: str | None = "public",
     ) -> int:
         """
         Insert data into a specified table, returning the number of rows inserted.
@@ -327,10 +359,10 @@ class SQLAlchemyAdapter:
                 return result.rowcount
 
         except Exception as e:
-            logger.error(f"Insert failed: {str(e)}")
-            raise e  # Re-raise for error handling upstream
+            logger.error(f"Insert failed: {e!s}")
+            raise  # Re-raise for error handling upstream
 
-    async def get_schema_list(self) -> List[str]:
+    async def get_schema_list(self) -> list[str]:
         """
         Return a list of all schema names in the database, excluding system schemas.
 
@@ -353,7 +385,7 @@ class SQLAlchemyAdapter:
         return []
 
     async def delete_entity_by_id(
-        self, table_name: str, data_id: UUID, schema_name: Optional[str] = "public"
+        self, table_name: str, data_id: UUID, schema_name: str | None = "public"
     ):
         """
         Delete an entity from the specified table based on its unique ID.
@@ -410,7 +442,7 @@ class SQLAlchemyAdapter:
                 ).one()
             except (ValueError, NoResultFound) as e:
                 raise EntityNotFoundError(
-                    message=f"Data {data_id} not found in dataset {dataset_id}: {str(e)}"
+                    message=f"Data {data_id} not found in dataset {dataset_id}: {e!s}"
                 ) from e
 
             raw_data_location = data_entity.raw_data_location
@@ -418,6 +450,12 @@ class SQLAlchemyAdapter:
 
             await session.execute(delete(Data).where(Data.id == data_id))
             await session.commit()
+
+        # Edge-evidence rows have no foreign key to Data (graph deletion must
+        # never depend on the sidecar), so they are swept here explicitly.
+        from cognee.modules.provenance.edge_evidence.cleanup import delete_edge_evidence
+
+        await delete_edge_evidence(dataset_id, data_id)
 
         # Storage cleanup runs after the commit so the reference count reflects
         # the deletion. Both the derived text (raw_data_location) and the
@@ -427,39 +465,57 @@ class SQLAlchemyAdapter:
         await self.remove_data_file_if_unreferenced(raw_data_location)
         await self.remove_data_file_if_unreferenced(original_data_location)
 
-    async def remove_data_file_if_unreferenced(self, file_location: Optional[str]) -> None:
+    async def remove_data_file_if_unreferenced(self, file_location: str | None) -> None:
         """Remove a cognee-managed stored file once no ``Data`` row references it.
 
         A location outside the data root is a user's own file (a local path, an
         external s3:// URL) and is never touched. Content-addressed keys are
         shared by design — two rows with identical payloads point at one object
         — so the reference count spans both location columns of every dataset.
+        A file another operation stored and has yet to commit a row for stays
+        (``stored_file_claims``).
         """
-        if not file_location:
+        if not file_location or not self.is_managed_data_file(file_location):
             return
+        async with removing_stored_files() as claimed_elsewhere:
+            if claimed_elsewhere(file_location):
+                return
+            if await self.referenced_data_files([file_location]):
+                return
+            await self.remove_data_file(file_location)
 
-        storage_config = get_storage_config()
-        data_root = storage_config["data_root_directory"]
-        if data_root not in file_location:
-            return
+    @staticmethod
+    def is_managed_data_file(file_location: str) -> bool:
+        """Whether ``file_location`` is under cognee's data root, not a user's own file."""
+        return get_storage_config()["data_root_directory"] in file_location
 
+    async def referenced_data_files(self, file_locations: list[str]) -> set[str]:
+        """The subset of ``file_locations`` some ``Data`` row still points at.
+
+        Either location column, any dataset. One query per ``_LOCATION_CHUNK``
+        locations instead of one per file, so releasing many files costs one
+        scan, not one each.
+        """
+        referenced: set[str] = set()
         async with self.get_async_session() as session:
-            references = (
-                await session.execute(
-                    select(func.count())
-                    .select_from(Data)
-                    .where(
+            for start in range(0, len(file_locations), _LOCATION_CHUNK):
+                chunk = file_locations[start : start + _LOCATION_CHUNK]
+                rows = await session.execute(
+                    select(Data.raw_data_location, Data.original_data_location).where(
                         or_(
-                            Data.raw_data_location == file_location,
-                            Data.original_data_location == file_location,
+                            Data.raw_data_location.in_(chunk),
+                            Data.original_data_location.in_(chunk),
                         )
                     )
                 )
-            ).scalar()
+                wanted = set(chunk)
+                for raw_location, original_location in rows:
+                    referenced.update(wanted & {raw_location, original_location})
+        return referenced
 
-        if references:
-            return
-
+    async def remove_data_file(self, file_location: str) -> None:
+        """Remove one stored file under the data root, with no reference check."""
+        data_root = get_storage_config()["data_root_directory"]
         relative_path = file_location.split(data_root, 1)[1].lstrip("/\\")
         if file_location.startswith("file://"):
             # file:// locations carry percent-encoding (spaces as %20); storage
@@ -472,7 +528,7 @@ class SQLAlchemyAdapter:
         else:
             logger.warning("Stored file to clean up was already gone: %s", file_location)
 
-    async def get_table(self, table_name: str, schema_name: Optional[str] = "public") -> Table:
+    async def get_table(self, table_name: str, schema_name: str | None = "public") -> Table:
         """
         Load a table dynamically using the specified name and schema information.
 
@@ -521,7 +577,7 @@ class SQLAlchemyAdapter:
                     return metadata.tables[full_table_name]
                 raise EntityNotFoundError(message=f"Table '{full_table_name}' not found.")
 
-    async def get_table_names(self) -> List[str]:
+    async def get_table_names(self) -> list[str]:
         """
         Return a list of all table names in the database, regardless of their model definitions.
 
@@ -551,7 +607,7 @@ class SQLAlchemyAdapter:
 
         return table_names
 
-    async def get_data(self, table_name: str, filters: dict = None):
+    async def get_data(self, table_name: str, filters: dict | None = None):
         """
         Retrieve data from a specified table using optional filtering conditions.
 
@@ -656,12 +712,21 @@ class SQLAlchemyAdapter:
                 logger.debug("Database tables dropped successfully.")
             except Exception as e:
                 logger.error(f"Error dropping database tables: {e}")
-                raise e
+                raise
 
-    async def create_database(self):
+    async def create_database(self, script_location: str | None = None):
         """
-        Create the database if it does not exist, ensuring necessary directories are in place
-        for SQLite.
+        Create the database by applying the Alembic migration chain: prepare the
+        storage (SQLite directory, pgvector extension), then ``alembic upgrade
+        head``. The initial revision carries the frozen base schema and every
+        revision is existence-guarded, so the chain builds the complete schema
+        on an empty database and no-ops per revision on an existing one. There
+        is no stamping: ``alembic_version`` only ever records revisions that
+        actually executed.
+
+        ``script_location`` overrides the Alembic scripts directory (falls back
+        to ``COGNEE_ALEMBIC_PATH``, then cognee's packaged chain). The chain runs
+        against THIS adapter's database.
         """
         if self.engine.dialect.name == "sqlite":
             db_directory = path.dirname(self.db_path)
@@ -681,8 +746,11 @@ class SQLAlchemyAdapter:
                 and self.engine.dialect.name == "postgresql"
             ):
                 await connection.execute(text("CREATE EXTENSION IF NOT EXISTS vector;"))
-            if len(Base.metadata.tables.keys()) > 0:
-                await connection.run_sync(Base.metadata.create_all)
+
+        # Imported at call time: the migrations module sits above this adapter layer.
+        from cognee.modules.migrations.startup import run_relational_migrations
+
+        await run_relational_migrations("head", script_location, engine=self)
 
     async def delete_database(self):
         """
@@ -754,7 +822,7 @@ class SQLAlchemyAdapter:
 
         except Exception as e:
             logger.error(f"Error deleting database: {e}")
-            raise e
+            raise
 
         logger.info("Database deleted successfully.")
 
@@ -813,7 +881,9 @@ class SQLAlchemyAdapter:
                 for schema_name in schema_list:
                     # Get tables for the current schema via the inspector.
                     tables = await connection.run_sync(
-                        lambda sync_conn: inspect(sync_conn).get_table_names(schema=schema_name)
+                        lambda sync_conn, schema_name=schema_name: inspect(
+                            sync_conn
+                        ).get_table_names(schema=schema_name)
                     )
                     for table_name in tables:
                         # Optionally, qualify the table name with the schema if not in the default schema.

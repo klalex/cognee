@@ -1,7 +1,9 @@
+import builtins
 from os.path import basename
 from uuid import UUID
 
 from cognee.modules.chunking.Chunker import Chunker
+
 from .Document import Document
 
 
@@ -20,7 +22,7 @@ class DltSourceDocument(Document):
     type: str = "dlt_source"
     mime_type: str = "application/x-dlt-source"
 
-    async def read(self, chunker_cls: Chunker, max_chunk_size: int):
+    async def read(self, chunker_cls: builtins.type[Chunker], max_chunk_size: int):
         from cognee.modules.chunking.models.DltRow import DltRow
         from cognee.tasks.ingestion.dlt_utils import load_dlt_manifest
 
@@ -33,6 +35,7 @@ class DltSourceDocument(Document):
 
             yield DltRow(
                 id=UUID(row["node_id"]),
+                name=f"{row['table_name']}:{row['primary_key_value']}",
                 text=text,
                 chunk_size=len(text.split()),
                 chunk_index=chunk_index,

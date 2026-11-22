@@ -8,27 +8,32 @@ documents in the knowledge graph. The flow:
 Curator calls run in parallel by batch; judge/write calls run in parallel by lesson.
 """
 
-from typing import List, Literal, Optional
+from typing import Literal
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, PrivateAttr
 
-from cognee.infrastructure.session.session_context_models import (
-    MIN_GATE_CONFIDENCE as MIN_GATE_CONFIDENCE,
-)
+from cognee.infrastructure.session.session_context_models import GATE_CONFIDENCE
 
 # -- Tunables ----------------------------------------------------------------
 
-# Gate: a context entry is distillable only when it passes the shared usability
-# check (never rated harmful, confidence clears MIN_GATE_CONFIDENCE). The
-# threshold lives next to the session-context models; re-exported above.
+# Gate: a context entry is distillable when its NET helpfulness is
+# non-negative and its confidence clears the threshold
+# (``distill.is_entry_distillable``) — deliberately looser than the
+# never-rated-harmful rule serving and preferences use
+# (``is_context_entry_usable``). The threshold is the session layer's
+# GATE_CONFIDENCE; the local name is kept for its importers.
+MIN_GATE_CONFIDENCE = GATE_CONFIDENCE
 
 # Batching: pack capped timeline blocks into coarse batches. Six worst-case QA
 # blocks plus separators stays below the budget, so the batching logic can stay simple.
 BATCH_CHAR_BUDGET = 16_000
 CURATOR_BLOCKS_PER_BATCH = 6
+# A run curates every new gated entry unless ``IMPROVE_DISTILL_MAX_BATCHES_PER_RUN``
+# caps it; entries past a cap are sealed by the watermark, not carried over.
 MAX_QA_QUESTION_CHARS = 1_200
 MAX_QA_ANSWER_CHARS = 1_200
 MAX_CANDIDATE_CHARS = 280
+MAX_QA_FEEDBACK_CHARS = 200  # explicit feedback text appended to a QA block
 
 # Bounded concurrency for the two parallel fan-outs.
 CURATOR_CONCURRENCY = 5
@@ -48,7 +53,7 @@ class ProposedLesson(BaseModel):
     working_statement: str = Field(
         description="One standalone sentence capturing the durable learning."
     )
-    member_entry_ids: List[str] = Field(
+    member_entry_ids: list[str] = Field(
         default_factory=list,
         description="Ids of the candidate memories this lesson draws from (may be empty).",
     )
@@ -57,7 +62,54 @@ class ProposedLesson(BaseModel):
 class CuratorBatchOutput(BaseModel):
     """Proposed lessons from one curator batch call."""
 
-    lessons: List[ProposedLesson] = Field(default_factory=list)
+    lessons: list[ProposedLesson] = Field(default_factory=list)
+
+
+# -- Coding distillation (DISTILLATION_MODE=coding, SDK-1335) ----------------
+#
+# Subclasses rather than optional fields on the base models: the base schema is
+# what the default-mode LLM calls send, and it must not change with the mode.
+
+LessonType = Literal["location", "pitfall", "convention", "constraint", "change", "state", "other"]
+LESSON_TYPES = ("location", "pitfall", "convention", "constraint", "change", "state", "other")
+TEST_BASELINE_STATE_KEY = "test-baseline"
+FOOTPRINT_STATE_KEY_PREFIX = "footprint:"
+PITFALL_STATE_KEY_PREFIX = "pitfall:"
+# The writer's compact style, appended to its input in coding mode.
+CODING_WRITER_STYLE_LINE = (
+    "STYLE: compact — statement at most 25 words, one sentence (or 'problem → working form' "
+    "for a pitfall), name the file/symbol/command, no explanation of how it was learned"
+)
+
+
+class CodingProposedLesson(ProposedLesson):
+    """A proposed lesson that may carry a state key (``test-baseline``, ``footprint:<feature>``)."""
+
+    state_key: str = Field(
+        default="",
+        description=(
+            "Only for a current-state lesson: 'test-baseline' or 'footprint:<feature>'. "
+            "Empty otherwise."
+        ),
+    )
+
+
+class CodingCuratorBatchOutput(BaseModel):
+    """Proposed coding lessons from one curator batch call."""
+
+    lessons: list[CodingProposedLesson] = Field(default_factory=list)
+
+
+class DuplicateProposalGroups(BaseModel):
+    """The proposals of one run that state the same fact, by their numbers in the input."""
+
+    groups: list[list[int]] = Field(
+        default_factory=list,
+        description=(
+            "Each group lists the numbers of lessons that are duplicates of each other "
+            "(two or more). Lessons without a duplicate are left out."
+        ),
+    )
 
 
 # -- Writer/rejecter output (one call per proposed lesson) -------------------
@@ -67,7 +119,7 @@ class WrittenLesson(BaseModel):
     """A per-lesson decision: accept (and write it) or reject (with a reason)."""
 
     accept: bool = Field(description="True to persist this lesson, False to drop it.")
-    reason: Optional[Literal["already_known", "not_durable", "unsupported"]] = Field(
+    reason: Literal["already_known", "not_durable", "unsupported"] | None = Field(
         default=None,
         description="Why the lesson was rejected, when accept is False.",
     )
@@ -75,13 +127,47 @@ class WrittenLesson(BaseModel):
         default="",
         description="Standalone, entity-anchored prose for the lesson, when accepted.",
     )
-    entities: List[str] = Field(
+    entities: list[str] = Field(
         default_factory=list,
         description="Glossary entity names used in the statement.",
     )
     why_learned: str = Field(
         default="",
         description="One sentence naming the situation it was learned in.",
+    )
+
+
+class CodingWrittenLesson(WrittenLesson):
+    """A written coding lesson: typed, and keyed when it is a state or a pitfall.
+
+    ``turn_context`` is the context JSON of the turn the lesson was learned in (the
+    plugin's ``date``, ``end_commit``, ``branch``, ...), attached after the writer call;
+    a private attribute, so the LLM schema does not carry it.
+    """
+
+    _turn_context: dict = PrivateAttr(default_factory=dict)
+
+    @property
+    def turn_context(self) -> dict:
+        return self._turn_context
+
+    def with_turn_context(self, context: dict) -> "CodingWrittenLesson":
+        lesson = self.model_copy()
+        lesson._turn_context = dict(context)
+        return lesson
+
+    lesson_type: LessonType = Field(
+        default="other",
+        description=(
+            "What the lesson is: location, pitfall, convention, constraint, change, state or other."
+        ),
+    )
+    state_key: str = Field(
+        default="",
+        description=(
+            "Only for lesson_type 'state': 'test-baseline' or 'footprint:<feature>'. "
+            "Empty for every other type."
+        ),
     )
 
 
@@ -92,11 +178,14 @@ class DistillationResult(BaseModel):
     """Outcome of one distill_session call."""
 
     session_id: str
-    dataset_id: Optional[str] = None
+    dataset_id: str | None = None
     status: Literal[
         "completed",
         "no_gated_entries",
+        "no_new_entries",
         "no_proposed_lessons",
         "no_accepted_lessons",
     ]
-    documents: List[str] = Field(default_factory=list)
+    documents: list[str] = Field(default_factory=list)
+    # New gated entries sealed without curation because the run was capped.
+    uncurated_entries: int = 0

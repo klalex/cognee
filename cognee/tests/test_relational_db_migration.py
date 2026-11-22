@@ -1,18 +1,21 @@
 import os
 import pathlib
+
+import cognee
 from cognee.infrastructure.databases.graph import get_graph_engine
-from cognee.modules.data.methods.create_authorized_dataset import create_authorized_dataset
-from cognee.modules.users.methods import get_default_user
+from cognee.infrastructure.databases.relational import (
+    create_db_and_tables as create_relational_db_and_tables,
+)
 from cognee.infrastructure.databases.relational import (
     get_migration_relational_engine,
-    create_db_and_tables as create_relational_db_and_tables,
 )
 from cognee.infrastructure.databases.vector.pgvector import (
     create_db_and_tables as create_pgvector_db_and_tables,
 )
-from cognee.tasks.ingestion import migrate_relational_database
+from cognee.modules.data.methods.create_authorized_dataset import create_authorized_dataset
 from cognee.modules.search.types import SearchType
-import cognee
+from cognee.modules.users.methods import get_default_user
+from cognee.tasks.ingestion import migrate_relational_database
 
 TEST_DATASET_NAME = "migration_test_dataset"
 
@@ -48,7 +51,27 @@ async def relational_db_migration():
     schema = await migration_engine.extract_schema()
 
     graph_engine = await get_graph_engine()
-    await migrate_relational_database(graph_engine, schema=schema)
+    migrated_nodes, _ = await migrate_relational_database(graph_engine, schema=schema)
+
+    # The primary key column must never become a ColumnValue node: that maps a row to
+    # its own id. The column names and `primary_key` come from two separate SQLAlchemy
+    # reflection calls, so the skip check has to compare by value - on Postgres/MySQL
+    # the two strings are equal but are not the same object.
+    primary_key_columns = {
+        table_name: (details["primary_key"] or details["columns"][0]["name"])
+        for table_name, details in schema.items()
+    }
+    primary_key_column_nodes = []
+    for _node_id, node_data in migrated_nodes:
+        # ColumnValue nodes are named "<table>:<column>:<value>".
+        parts = (node_data.get("name") or "").split(":", 2)
+        if len(parts) == 3 and primary_key_columns.get(parts[0]) == parts[1]:
+            primary_key_column_nodes.append(node_data["name"])
+
+    assert not primary_key_column_nodes, (
+        "Primary key columns were mapped to ColumnValue nodes: "
+        f"{sorted(primary_key_column_nodes)[:5]}"
+    )
 
     # Create the dataset so search can find it by name
     user = await get_default_user()
@@ -201,8 +224,8 @@ async def relational_db_migration():
 
         # NOTE: Because of the different size of the postgres and sqlite databases,
         #       different number of nodes and edges are expected
-        assert node_count == 522, f"Expected 522 nodes, got {node_count}"
-        assert edge_count == 961, f"Expected 961 edges, got {edge_count}"
+        assert node_count == 430, f"Expected 430 nodes, got {node_count}"
+        assert edge_count == 869, f"Expected 869 edges, got {edge_count}"
 
     print(f"Node & edge count validated: node_count={node_count}, edge_count={edge_count}.")
 
@@ -229,7 +252,7 @@ async def test_schema_only_migration():
     }
 
     if graph_db_provider == "neo4j":
-        for rel_type in edge_counts.keys():
+        for rel_type in edge_counts:
             query_str = f"""
             MATCH ()-[r:{rel_type}]->()
             RETURN count(r) as c
@@ -238,7 +261,7 @@ async def test_schema_only_migration():
             edge_counts[rel_type] = rows[0]["c"]
 
     elif graph_db_provider in ("ladybug", "kuzu"):
-        for rel_type in edge_counts.keys():
+        for rel_type in edge_counts:
             query_str = f"""
             MATCH ()-[r:EDGE]->()
             WHERE r.relationship_name = '{rel_type}'
@@ -248,7 +271,7 @@ async def test_schema_only_migration():
             edge_counts[rel_type] = rows[0][0]
 
     elif graph_db_provider == "networkx":
-        nodes, edges = await graph_engine.get_graph_data()
+        _nodes, edges = await graph_engine.get_graph_data()
         for _, _, key, _ in edges:
             if key in edge_counts:
                 edge_counts[key] += 1

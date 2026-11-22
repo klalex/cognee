@@ -5,7 +5,7 @@ run anywhere. They verify ranker ordering, budget capping, candidate validation/
 fail-open contract.
 """
 
-from datetime import datetime
+from datetime import datetime, timezone
 from uuid import uuid4
 
 import pytest
@@ -30,7 +30,7 @@ def _entry(section, content, **kwargs):
         section=section,
         content=content,
         normalized_content=normalize_content(content),
-        created_at=kwargs.pop("created_at", datetime.utcnow().isoformat()),
+        created_at=kwargs.pop("created_at", datetime.now(timezone.utc).isoformat()),
         **kwargs,
     )
 
@@ -522,6 +522,7 @@ async def test_apply_agent_candidate_creates_entry_with_trace_source():
         {
             "section": "failure_lessons",
             "context_profile": "agent",
+            "reason": "The repository requires its locked uv environment.",
             "content": "Run uv sync before tests",
             "confidence": 0.85,
         }
@@ -546,6 +547,7 @@ async def test_apply_agent_candidate_dedupes_within_profile_section_only():
         {
             "section": "tool_rules",
             "context_profile": "agent",
+            "reason": "The repository requires its locked uv environment.",
             "content": "use uv run",
             "confidence": 0.85,
         }

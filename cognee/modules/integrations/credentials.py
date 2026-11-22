@@ -9,14 +9,17 @@ encrypted here and never returned in plaintext except by
 need to call the provider's API.
 """
 
+import asyncio
 import logging
-from datetime import datetime, timezone
-from typing import Any, Optional
+from collections.abc import Awaitable, Callable
+from datetime import datetime, timedelta, timezone
+from typing import Any, Final, Literal
 from uuid import UUID
 
-from cognee.infrastructure.databases.relational import get_relational_engine
-from sqlalchemy import select
+from sqlalchemy import and_, or_, select, update
 
+from cognee.infrastructure.databases.relational import get_relational_engine
+from cognee.infrastructure.locks.loop_agnostic_lock import LoopAgnosticLock
 from cognee.modules.integrations.crypto import decrypt_credentials, encrypt_credentials
 from cognee.modules.integrations.models.IntegrationCredential import IntegrationCredential
 
@@ -24,6 +27,103 @@ logger = logging.getLogger(__name__)
 
 STATUS_ACTIVE = "active"
 STATUS_REVOKED = "revoked"
+# Who revoked a connection (``IntegrationCredential.revoked_by``).
+REVOKED_BY_OWNER: Final = "owner"
+REVOKED_BY_PROVIDER: Final = "provider"
+
+
+class CredentialInactiveError(RuntimeError):
+    """The connection was disconnected or replaced while work was in flight."""
+
+
+async def require_active_credential(credential: IntegrationCredential) -> IntegrationCredential:
+    """Reload authorization; a detached row is not proof of a live connection."""
+    current = await get_credential_by_account(credential.provider, credential.provider_account_id)
+    if (
+        current is None
+        or current.status != STATUS_ACTIVE
+        or current.id != credential.id
+        or current.user_id != credential.user_id
+        or current.workspace_id != credential.workspace_id
+    ):
+        raise CredentialInactiveError(
+            f"{credential.provider} connection is no longer active for this owner"
+        )
+    return current
+
+
+def _current_token_conditions(credential: IntegrationCredential):
+    # Compare the encrypted token snapshot too: reconnect may reuse the same
+    # row and owner while an old refresh (or invalid_grant response) is pending.
+    return (
+        IntegrationCredential.id == credential.id,
+        IntegrationCredential.status == STATUS_ACTIVE,
+        IntegrationCredential.user_id == credential.user_id,
+        IntegrationCredential.workspace_id == credential.workspace_id,
+        IntegrationCredential.ciphertext == credential.ciphertext,
+        IntegrationCredential.nonce == credential.nonce,
+    )
+
+
+async def update_refreshed_credential(
+    credential: IntegrationCredential,
+    *,
+    token_payload: dict[str, Any],
+    token_expires_at: datetime | None,
+    scopes: str | None,
+) -> None:
+    """Atomically refresh an active token; never install/reactivate a connection."""
+    ciphertext, nonce, version, key_id = encrypt_credentials(token_payload)
+    async with get_relational_engine().get_async_session() as db:
+        result = await db.execute(
+            update(IntegrationCredential)
+            .where(*_current_token_conditions(credential))
+            .values(
+                ciphertext=ciphertext,
+                nonce=nonce,
+                encryption_version=version,
+                key_id=key_id,
+                token_expires_at=token_expires_at,
+                scopes=scopes,
+            )
+        )
+        await db.commit()
+        if result.rowcount != 1:
+            raise CredentialInactiveError("Connection changed while refreshing its token")
+
+
+async def revoke_credential_if_current(credential: IntegrationCredential) -> None:
+    """Revoke a connection whose token the provider rejected (``revoked_by`` provider).
+
+    An old invalid_grant must not revoke a newly reconnected account.
+    """
+    async with get_relational_engine().get_async_session() as db:
+        await db.execute(
+            update(IntegrationCredential)
+            .where(*_current_token_conditions(credential))
+            .values(
+                status=STATUS_REVOKED,
+                revoked_at=datetime.now(timezone.utc),
+                revoked_by=REVOKED_BY_PROVIDER,
+            )
+        )
+        await db.commit()
+
+
+class _Unset:
+    """Marker for an argument :func:`upsert_credential` was not given.
+
+    ``None`` is a meaningful value for both ``workspace_id`` (no workspace
+    owns this row) and ``provider_metadata`` (nothing stored), so "not
+    supplied" has to be distinguishable from it. Without that distinction
+    every caller that leaves one out silently clears what is already there.
+    """
+
+    def __repr__(self) -> str:
+        return "UNSET"
+
+
+UNSET = _Unset()
 
 
 class CrossUserConflictError(Exception):
@@ -39,18 +139,30 @@ class CrossUserConflictError(Exception):
     """
 
 
+# One lock per connection, held by every write of ``provider_metadata``: each one
+# reads the row, merges in Python and writes the whole column back, so writes that
+# overlapped kept only the last one (a thread mark, a removed message, ``uninstalled_at``).
+# The row is also read ``FOR UPDATE``, which serializes writers across processes on
+# Postgres; SQLite has no row locks, so there it holds within one process.
+_metadata_locks: dict[tuple[str, str], LoopAgnosticLock] = {}
+
+
+def _metadata_lock(provider: str, provider_account_id: Any) -> LoopAgnosticLock:
+    return _metadata_locks.setdefault((provider, str(provider_account_id)), LoopAgnosticLock())
+
+
 async def upsert_credential(
     *,
     provider: str,
     user_id: UUID,
     provider_account_id: str,
     token_payload: dict[str, Any],
-    workspace_id: Optional[UUID] = None,
-    account_label: Optional[str] = None,
+    workspace_id: UUID | None | _Unset = UNSET,
+    account_label: str | None = None,
     auth_type: str = "oauth2",
-    scopes: Optional[str] = None,
-    provider_metadata: Optional[dict[str, Any]] = None,
-    token_expires_at: Optional[datetime] = None,
+    scopes: str | None = None,
+    provider_metadata: dict[str, Any] | None | _Unset = UNSET,
+    token_expires_at: datetime | None = None,
 ) -> IntegrationCredential:
     """Insert or replace the credential for a ``(provider, provider_account_id)``.
 
@@ -62,52 +174,103 @@ async def upsert_credential(
     connection — the original owner must disconnect (or the account be
     revoked) first.
 
-    ``workspace_id`` is optional and defaults to ``None``, which reproduces
-    the original single-user contract exactly: ``user_id`` is the owner, and
-    conflicts are compared on it. Pass ``workspace_id`` when several users
-    share one connection (a cognee-hosted multi-user workspace, or a
-    downstream layer's own tenant concept) — it then becomes the owner/
-    conflict key instead, while ``user_id`` still records who connected it.
+    ``workspace_id`` is optional. Omitted, it reproduces the original
+    single-user contract exactly: ``user_id`` is the owner, conflicts are
+    compared on it, and whatever the row already carries is left untouched.
+    Pass ``workspace_id`` when several users share one connection (a
+    cognee-hosted multi-user workspace, or a downstream layer's own tenant
+    concept) and it becomes the owner/conflict key instead, while ``user_id``
+    still records who connected it.
+
+    ``provider_metadata`` is **merged** into what is stored rather than
+    swapping for it. Providers rebuild their whole metadata dict from each
+    token response, so every key they own is refreshed either way; what
+    merging protects is the keys that cannot be re-derived from that response
+    because they were written separately through
+    :func:`update_provider_metadata` (today: Slack's channel allowlist).
+    Replacing instead of merging meant a plain reconnect through
+    :mod:`cognee.modules.integrations.connect` dropped them silently, and an
+    empty Slack allowlist reads as "every channel allowed".
+
+    Three consequences of merging worth knowing, none of them accidental.
+    Neither ``None`` nor ``{}`` clears the stored metadata, so this function
+    cannot empty it at all — unlike ``workspace_id``, where an explicit
+    ``None`` still means "no workspace owns this". Keys an adapter stops
+    emitting now survive, so an adapter that builds its dict conditionally
+    has to write the key with a null rather than leave it out. And a revoked
+    row is reused rather than replaced (see below); the merge keeps its metadata
+    only for the same owner. Another owner connecting it starts from what the
+    installation provides alone, as a first install does, so no selection,
+    setting or sync history of the previous owner reaches them.
+
+    The other optional arguments (``account_label``, ``auth_type``,
+    ``scopes``, ``token_expires_at``) are still assigned unconditionally: a
+    caller that omits one clears it. That is the pre-existing contract and
+    every current caller passes what it needs, but do not read "omitted means
+    untouched" as applying to them.
     """
+    # Resolved before the conflict check so that an omitted workspace_id is
+    # read as "this caller does not deal in workspaces" (the original
+    # user-owned contract) rather than as an explicit None, while still
+    # leaving any stored workspace_id alone further down.
+    conflict_workspace_id = None if isinstance(workspace_id, _Unset) else workspace_id
+
     ciphertext, nonce, encryption_version, key_id = encrypt_credentials(token_payload)
 
     engine = get_relational_engine()
-    async with engine.get_async_session() as db:
+    async with (
+        _metadata_lock(provider, provider_account_id),
+        engine.get_async_session() as db,
+    ):
         result = await db.execute(
-            select(IntegrationCredential).where(
+            select(IntegrationCredential)
+            .where(
                 IntegrationCredential.provider == provider,
                 IntegrationCredential.provider_account_id == provider_account_id,
             )
+            .with_for_update()
         )
         credential = result.scalar_one_or_none()
 
-        if credential is not None and credential.status == STATUS_ACTIVE:
-            existing_owner = (
-                credential.workspace_id if workspace_id is not None else credential.user_id
-            )
-            new_owner = workspace_id if workspace_id is not None else user_id
-            if existing_owner != new_owner:
-                logger.warning(
-                    "Refused %s reconnect: account %s already active for owner %s, not %s",
-                    provider,
-                    provider_account_id,
-                    existing_owner,
-                    new_owner,
-                )
-                raise CrossUserConflictError(provider_account_id)
-
+        new_owner = conflict_workspace_id if conflict_workspace_id is not None else user_id
         if credential is None:
             credential = IntegrationCredential(
                 provider=provider, provider_account_id=provider_account_id
             )
             db.add(credential)
+        else:
+            existing_owner = (
+                credential.workspace_id if conflict_workspace_id is not None else credential.user_id
+            )
+            if existing_owner != new_owner:
+                if credential.status == STATUS_ACTIVE:
+                    logger.warning(
+                        "Refused %s reconnect: account %s already active for owner %s, not %s",
+                        provider,
+                        provider_account_id,
+                        existing_owner,
+                        new_owner,
+                    )
+                    raise CrossUserConflictError(provider_account_id)
+                # Another owner takes over this account's revoked connection and starts as
+                # a first install does: everything kept on the row (the selection, settings,
+                # sync history, a provider's own markers) was the previous owner's.
+                credential.provider_metadata = {}
+                credential.last_synced_at = None
+                credential.sync_status = None
 
         credential.user_id = user_id
-        credential.workspace_id = workspace_id
+        if not isinstance(workspace_id, _Unset):
+            credential.workspace_id = workspace_id
         credential.account_label = account_label
         credential.auth_type = auth_type
         credential.scopes = scopes
-        credential.provider_metadata = provider_metadata
+        if not isinstance(provider_metadata, _Unset):
+            # Under the connection's metadata lock, like every other writer.
+            credential.provider_metadata = {
+                **(credential.provider_metadata or {}),
+                **(provider_metadata or {}),
+            }
         credential.ciphertext = ciphertext
         credential.nonce = nonce
         credential.encryption_version = encryption_version
@@ -115,6 +278,7 @@ async def upsert_credential(
         credential.token_expires_at = token_expires_at
         credential.status = STATUS_ACTIVE
         credential.revoked_at = None
+        credential.revoked_by = None
 
         await db.commit()
         await db.refresh(credential)
@@ -123,7 +287,7 @@ async def upsert_credential(
 
 async def get_credential_by_account(
     provider: str, provider_account_id: str
-) -> Optional[IntegrationCredential]:
+) -> IntegrationCredential | None:
     """Resolve an inbound webhook's external account id back to its credential."""
     engine = get_relational_engine()
     async with engine.get_async_session() as db:
@@ -137,27 +301,93 @@ async def get_credential_by_account(
 
 
 async def get_active_credential_for_user(
-    user_id: UUID, provider: str
-) -> Optional[IntegrationCredential]:
+    user_id: UUID, provider: str, provider_account_id: str | None = None
+) -> IntegrationCredential | None:
     """The user's active connection for a provider, for the Integrations UI.
 
     A user *can* hold more than one active connection for a provider (two
     Slack workspaces, both provider='slack', same user) — the schema allows
     it. Ordered newest-first so the choice is deterministic (the most recently
-    connected wins) rather than DB-arbitrary.
+    connected wins) rather than DB-arbitrary. With ``provider_account_id`` the
+    answer is that account's connection, or ``None`` when it is not this
+    user's: there is no fallback to another account.
     """
+    connections = await list_active_credentials_for_provider(user_id, provider, provider_account_id)
+    return connections[0] if connections else None
+
+
+async def list_active_credentials_for_provider(
+    user_id: UUID, provider: str, provider_account_id: str | None = None
+) -> list[IntegrationCredential]:
+    """The user's active connections for one provider, newest first."""
+    conditions = [
+        IntegrationCredential.user_id == user_id,
+        IntegrationCredential.provider == provider,
+        IntegrationCredential.status == STATUS_ACTIVE,
+    ]
+    if provider_account_id is not None:
+        conditions.append(IntegrationCredential.provider_account_id == provider_account_id)
     engine = get_relational_engine()
     async with engine.get_async_session() as db:
         result = await db.execute(
             select(IntegrationCredential)
-            .where(
-                IntegrationCredential.user_id == user_id,
-                IntegrationCredential.provider == provider,
-                IntegrationCredential.status == STATUS_ACTIVE,
-            )
+            .where(*conditions)
             .order_by(IntegrationCredential.created_at.desc())
         )
-        return result.scalars().first()
+        return list(result.scalars().all())
+
+
+def owner_principal_id(credential: IntegrationCredential) -> UUID:
+    """The principal a connection belongs to: its ``workspace_id`` when set, else the
+    user who connected it. ``list_active_credential_ids_for_owner`` is the same rule in SQL.
+    """
+    return credential.workspace_id if credential.workspace_id is not None else credential.user_id
+
+
+async def list_active_credential_ids_for_owner(principal_id: UUID) -> list[UUID]:
+    """The active connections ``owner_principal_id`` assigns to ``principal_id``."""
+    # Not coalesce(workspace_id, user_id): it reads the same rows but scans the whole
+    # table, while this form uses both indexes (8 ms against 0.03 ms at 200k rows).
+    owned = or_(
+        IntegrationCredential.workspace_id == principal_id,
+        and_(
+            IntegrationCredential.workspace_id.is_(None),
+            IntegrationCredential.user_id == principal_id,
+        ),
+    )
+    async with get_relational_engine().get_async_session() as db:
+        result = await db.execute(
+            select(IntegrationCredential.id).where(
+                IntegrationCredential.status == STATUS_ACTIVE, owned
+            )
+        )
+        return list(result.scalars().all())
+
+
+async def get_ended_connection(
+    user_id: UUID, provider: str, provider_account_id: str | None = None
+) -> IntegrationCredential | None:
+    """The user's newest revoked connection to ``provider``, or to the account named.
+
+    Asked when the user has no active one, so the Integrations page can say who ended it
+    (``revoked_by``) and where its data stays. A row another user has since connected
+    over is theirs and never answers here.
+    """
+    conditions = [
+        IntegrationCredential.user_id == user_id,
+        IntegrationCredential.provider == provider,
+        IntegrationCredential.status == STATUS_REVOKED,
+    ]
+    if provider_account_id is not None:
+        conditions.append(IntegrationCredential.provider_account_id == provider_account_id)
+    async with get_relational_engine().get_async_session() as db:
+        result = await db.execute(
+            select(IntegrationCredential)
+            .where(*conditions)
+            .order_by(IntegrationCredential.revoked_at.desc().nulls_last())
+            .limit(1)
+        )
+        return result.scalar_one_or_none()
 
 
 async def list_active_credentials_for_user(user_id: UUID) -> dict[str, IntegrationCredential]:
@@ -165,10 +395,12 @@ async def list_active_credentials_for_user(user_id: UUID) -> dict[str, Integrati
 
     Returns a dict of ``provider -> credential`` holding at most one
     credential per provider, chosen newest-first — the same tiebreak as
-    :func:`get_active_credential_for_user`, so the aggregate status endpoint
-    and the per-provider connection endpoint always agree on which
-    connection represents a provider. For display use: token material stays
-    encrypted on the rows and must not be surfaced by callers.
+    :func:`get_active_credential_for_user` called without an account, so the
+    aggregate status endpoint and the per-provider connection endpoint agree on
+    which connection represents a provider. A user's other connections to that
+    provider are not here: :func:`list_active_credentials_for_provider` lists
+    them. For display use: token material stays encrypted on the rows and must
+    not be surfaced by callers.
     """
     engine = get_relational_engine()
     async with engine.get_async_session() as db:
@@ -188,7 +420,7 @@ async def list_active_credentials_for_user(user_id: UUID) -> dict[str, Integrati
 
 async def get_active_credential_for_workspace(
     workspace_id: UUID, provider: str
-) -> Optional[IntegrationCredential]:
+) -> IntegrationCredential | None:
     """The workspace's active connection for a provider.
 
     Mirrors :func:`get_active_credential_for_user` for the ``workspace_id``
@@ -210,10 +442,18 @@ async def get_active_credential_for_workspace(
         return result.scalars().first()
 
 
-async def revoke_credential_by_account(provider: str, provider_account_id: str) -> bool:
-    """Mark a connection revoked. Idempotent — providers retry webhooks and
-    give no ordering guarantee between uninstall/revoke events, so revoking an
-    already-revoked row is a silent no-op.
+async def revoke_credential_by_account(
+    provider: str,
+    provider_account_id: str,
+    revoked_by: Literal["owner", "provider"] | None = None,
+) -> bool:
+    """Mark a connection revoked, recording who did it (``REVOKED_BY_*``).
+
+    ``revoked_by`` stays ``None`` (unknown) for a caller that names no one, such as a
+    connector package released before the column. Idempotent — providers retry
+    webhooks and give no ordering guarantee between uninstall/revoke events, so
+    revoking an already-revoked row is a silent no-op that keeps the first
+    ``revoked_by``.
 
     Returns True when a row exists (already- or newly-revoked), False if none.
     """
@@ -234,6 +474,7 @@ async def revoke_credential_by_account(provider: str, provider_account_id: str) 
         if credential.status != STATUS_REVOKED:
             credential.status = STATUS_REVOKED
             credential.revoked_at = datetime.now(timezone.utc)
+            credential.revoked_by = revoked_by
             await db.commit()
 
         return True
@@ -241,7 +482,7 @@ async def revoke_credential_by_account(provider: str, provider_account_id: str) 
 
 async def update_provider_metadata(
     provider: str, provider_account_id: str, metadata_patch: dict[str, Any]
-) -> Optional[IntegrationCredential]:
+) -> IntegrationCredential | None:
     """Merge ``metadata_patch`` into a credential's ``provider_metadata``.
 
     Deliberately separate from :func:`upsert_credential`: that function
@@ -251,22 +492,153 @@ async def update_provider_metadata(
     ``None`` if no credential exists for that account — callers translate
     that into a 404, this module has no HTTP opinions of its own.
     """
+    return await change_provider_metadata(
+        provider, provider_account_id, lambda _current: metadata_patch
+    )
+
+
+async def change_provider_metadata(
+    provider: str,
+    provider_account_id: str,
+    change: Callable[[dict[str, Any]], dict[str, Any] | None],
+) -> IntegrationCredential | None:
+    """Merge the patch ``change`` computes from the stored ``provider_metadata``.
+
+    For a write that depends on what is stored (adding to a list, keeping the first
+    value): ``change`` gets the current metadata under the connection's lock, so a
+    concurrent write is never computed from a stale copy. A falsy patch writes nothing.
+    Returns ``None`` when no credential exists for that account.
+    """
     engine = get_relational_engine()
-    async with engine.get_async_session() as db:
+    async with (
+        _metadata_lock(provider, provider_account_id),
+        engine.get_async_session() as db,
+    ):
         result = await db.execute(
-            select(IntegrationCredential).where(
+            select(IntegrationCredential)
+            .where(
                 IntegrationCredential.provider == provider,
                 IntegrationCredential.provider_account_id == provider_account_id,
             )
+            .with_for_update()
         )
         credential = result.scalar_one_or_none()
         if credential is None:
             return None
 
-        credential.provider_metadata = {**(credential.provider_metadata or {}), **metadata_patch}
-        await db.commit()
-        await db.refresh(credential)
+        current = dict(credential.provider_metadata or {})
+        patch = change(current)
+        if patch:
+            credential.provider_metadata = {**current, **patch}
+            await db.commit()
+            await db.refresh(credential)
         return credential
+
+
+async def record_sync_result(
+    credential: IntegrationCredential,
+    *,
+    status: str,
+    scanned: int | None = None,
+    skipped: int | None = None,
+    failed: int | None = None,
+    counts: dict[str, int] | None = None,
+) -> IntegrationCredential | None:
+    """Stamp when a connector last synced a connection and how it went.
+
+    ``last_synced_at`` and ``sync_status`` have existed on the row since the
+    table was created and nothing wrote them, which left a failed or partial
+    sync invisible: the connection still read as healthy while its memory was
+    empty. A connector that has no webhook to self-heal on has no other way to
+    say so, which is why it stamps the outcome here.
+
+    Takes the connection the sync actually ran for rather than an external
+    account id, and re-checks it before writing. Syncs run detached and can
+    outlive the install that started them, while
+    :func:`upsert_credential` **reuses** the row for a
+    ``(provider, provider_account_id)`` rather than replacing it. So a stamp
+    addressed to the account alone would land on whoever holds that account
+    now: disconnect, someone else connects the same Google account, the old
+    owner's sync finishes last, and the new owner is told their Drive just
+    synced. The row is written only while it is still active and still owned
+    by the same owner (``workspace_id`` when set, ``user_id`` otherwise —
+    the same resolution :func:`upsert_credential` uses); a token refresh
+    mid-sync keeps both, so the ordinary path is unaffected.
+
+    Not closed by this check: the **same** owner disconnecting and
+    reconnecting the same account can still have a stale sync from the old
+    install stamp the new one. Nothing distinguishes one install of an
+    account from the next without a generation column, which this table
+    does not have.
+
+    ``status`` is the vocabulary the integrations UI already renders,
+    ``"ok"`` or ``"degraded"``. Deliberately separate from
+    :func:`upsert_credential`, which re-encrypts the whole token payload: a
+    sync result has nothing to do with the token. Best-effort by contract —
+    the caller is a detached background task and a failed stamp must never
+    take down a sync that otherwise worked.
+    """
+    try:
+        # Read from the object inside the guard, not above it: this can run
+        # from inside an ``except`` block (see ``sync_drive``), and anything
+        # raising here — even attribute access on a detached instance — must
+        # not replace the traceback that is already in flight.
+        provider = credential.provider
+        provider_account_id = credential.provider_account_id
+        # Compared by owner, not by user_id alone: a workspace connection
+        # reconnected under another workspace by the same human is another owner.
+        ran_for_owner = owner_principal_id(credential)
+
+        engine = get_relational_engine()
+        async with (
+            _metadata_lock(provider, provider_account_id),
+            engine.get_async_session() as db,
+        ):
+            result = await db.execute(
+                select(IntegrationCredential)
+                .where(
+                    IntegrationCredential.provider == provider,
+                    IntegrationCredential.provider_account_id == provider_account_id,
+                )
+                .with_for_update()
+            )
+            current = result.scalar_one_or_none()
+            if current is None:
+                return None
+
+            current_owner = owner_principal_id(current)
+            if current.status != STATUS_ACTIVE or current_owner != ran_for_owner:
+                logger.info(
+                    "Discarding a %s sync result for account %s: the connection it ran for "
+                    "is gone (status %s, owner %s, was %s)",
+                    provider,
+                    provider_account_id,
+                    current.status,
+                    current_owner,
+                    ran_for_owner,
+                )
+                return None
+
+            current.last_synced_at = datetime.now(timezone.utc)
+            current.sync_status = status
+            if counts is not None or any(value is not None for value in (scanned, skipped, failed)):
+                current.provider_metadata = {
+                    **(current.provider_metadata or {}),
+                    "last_sync_counts": {
+                        "scanned": scanned if scanned is not None else 0,
+                        "skipped": skipped if skipped is not None else 0,
+                        "failed": failed if failed is not None else 0,
+                        **(counts or {}),
+                    },
+                }
+            await db.commit()
+            await db.refresh(current)
+            return current
+    except Exception:
+        logger.exception(
+            "Recording the sync result for %s account %s failed", provider, provider_account_id
+        )
+        return None
 
 
 def decrypt_token_payload(credential: IntegrationCredential) -> dict[str, Any]:
@@ -277,3 +649,54 @@ def decrypt_token_payload(credential: IntegrationCredential) -> dict[str, Any]:
         credential.encryption_version,
         credential.key_id,
     )
+
+
+# How long before its expiry a stored access token is renewed, so a sync that takes a while does
+# not expire halfway through its walk.
+TOKEN_REFRESH_MARGIN: Final = timedelta(minutes=5)
+
+
+def token_is_expiring(expires_at: datetime | None, now: datetime) -> bool:
+    """True when a token expiring at ``expires_at`` is within ``TOKEN_REFRESH_MARGIN`` of it.
+    ``None`` never expires. A naive timestamp is UTC (SQLite stores no timezone; it is written
+    as UTC)."""
+    if expires_at is None:
+        return False
+    if expires_at.tzinfo is None:
+        expires_at = expires_at.replace(tzinfo=timezone.utc)
+    return expires_at - TOKEN_REFRESH_MARGIN <= now
+
+
+async def refreshed_credential(
+    credential: IntegrationCredential,
+    refresh: Callable[[IntegrationCredential], Awaitable[None]],
+    *,
+    locks: dict[str, asyncio.Lock],
+    read: Callable[[IntegrationCredential], Awaitable[IntegrationCredential]],
+    now: Callable[[], datetime],
+    rejected_ciphertext: bytes | None = None,
+) -> IntegrationCredential:
+    """The active row, with its token renewed first when it is near its expiry.
+
+    ``rejected_ciphertext`` is the stored token the provider just refused (an HTTP 401): it is
+    renewed whatever its expiry says, unless the row no longer holds it (another caller
+    renewed it, or the account was reconnected), in which case the current row is returned.
+
+    One lock per account in ``locks``, so callers that find the same token expiring or
+    refused renew it once; the others read the row back after the lock and find it renewed.
+    Reading back under the lock matters for a provider that rotates its refresh token: a
+    second refresh would spend a token that no longer works. ``read`` re-reads the active
+    row; a refresh writes through its own session, so the row is read back after it. The
+    lock is process-local; ``update_refreshed_credential``'s compare-and-swap covers a second
+    process.
+    """
+    credential = await read(credential)
+    if rejected_ciphertext is None and not token_is_expiring(credential.token_expires_at, now()):
+        return credential
+    async with locks.setdefault(str(credential.provider_account_id), asyncio.Lock()):
+        credential = await read(credential)
+        refused = rejected_ciphertext is not None and credential.ciphertext == rejected_ciphertext
+        if refused or token_is_expiring(credential.token_expires_at, now()):
+            await refresh(credential)
+            credential = await read(credential)
+    return credential

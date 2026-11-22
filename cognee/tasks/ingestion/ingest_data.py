@@ -1,35 +1,47 @@
 import asyncio
-import json
 import inspect
+import json
 import os
+from pathlib import Path
+from typing import TYPE_CHECKING, Any, BinaryIO
+from urllib.parse import urlparse
 from uuid import UUID, uuid4
-from typing import TYPE_CHECKING, Union, BinaryIO, Any, List, Optional
 
-import cognee.modules.ingestion as ingestion
 from sqlalchemy import select
 from sqlalchemy.exc import IntegrityError
+
 from cognee.infrastructure.databases.relational import get_relational_engine
-from cognee.modules.ingestion.identify_many import identify_many
-from cognee.modules.data.models import Data
-from cognee.modules.ingestion.exceptions import IngestionError
-from cognee.modules.users.models import User
-from cognee.modules.users.methods import get_default_user
-from cognee.modules.users.permissions.methods import get_specific_user_permission_datasets
-from cognee.infrastructure.files.utils.open_data_file import open_data_file
+from cognee.infrastructure.files.stored_file_claims import holding_stored_files
 from cognee.infrastructure.files.utils.get_data_file_path import get_data_file_path
+from cognee.infrastructure.files.utils.open_data_file import open_data_file
 from cognee.infrastructure.loaders.LoaderInterface import LoaderResult
+from cognee.modules import ingestion
 from cognee.modules.data.methods import (
     get_authorized_existing_datasets,
-    resolve_data_id,
     load_or_create_datasets,
+    resolve_data_id,
 )
-
+from cognee.modules.data.methods.remove_unreferenced_files import remove_unreferenced_files
+from cognee.modules.data.models import Data
+from cognee.modules.engine.models.node_set import (
+    NodeSet,
+    parse_node_set_names,
+    validate_node_set_names,
+)
+from cognee.modules.ingestion.exceptions import IngestionError
+from cognee.modules.ingestion.identify_many import identify_many
+from cognee.modules.users.methods import get_default_user
+from cognee.modules.users.models import User
+from cognee.modules.users.permissions.methods import get_specific_user_permission_datasets
 from cognee.shared.logging_utils import get_logger
 
-from .save_data_item_to_storage import save_data_item_to_storage_detailed
 from .carried_source import find_carried_source
-from .data_item_to_text_file import data_item_to_text_file
 from .data_item import DataItem
+from .data_item_to_text_file import data_item_to_text_file
+from .save_data_item_to_storage import (
+    local_file_paths_accepted,
+    save_data_item_to_storage_detailed,
+)
 
 if TYPE_CHECKING:  # pragma: no cover - import cycle: pipelines imports this package
     from cognee.modules.pipelines.models import PipelineContext
@@ -37,7 +49,7 @@ if TYPE_CHECKING:  # pragma: no cover - import cycle: pipelines imports this pac
 logger = get_logger(__name__)
 
 
-def _display_file_name(file_metadata: Optional[dict], actual_file_path: str) -> str:
+def _display_file_name(file_metadata: dict | None, actual_file_path: str) -> str:
     """The filename to show loaders for a payload, as the user would name it.
 
     ``FileMetadata`` splits a name into an extension-less ``name`` plus a
@@ -52,7 +64,62 @@ def _display_file_name(file_metadata: Optional[dict], actual_file_path: str) -> 
     return f"{name}.{extension}" if extension else name
 
 
-def _pipeline_dataset_for(ctx, dataset_name: Optional[str], dataset_id: Optional[UUID], user: User):
+def merge_existing_row_metadata(
+    stored_metadata: dict[str, Any] | None,
+    stored_node_set: str | None,
+    content_metadata: dict[str, Any],
+    item_external_metadata: dict[str, Any] | None,
+    node_set: list[str] | None,
+    source_uri: str | None = None,
+    content_changed: bool = False,
+) -> tuple[dict[str, Any], list[str] | None]:
+    """Resolve the metadata and node set a re-ingested row ends up with.
+
+    A re-ingest of an existing row is a PATCH: a field the request does not carry
+    keeps its stored value, an explicit empty value clears it, a value replaces it.
+    ``label`` already follows this rule in the update branch; this applies it to
+    ``external_metadata`` (``None`` keeps, ``{}`` clears, a dict replaces) and to
+    ``node_set`` (``None`` keeps, ``[]`` clears, a list replaces). Content-derived
+    metadata always refreshes on top, since it describes the new content:
+    ``content_metadata``, and ``source_uri`` (where the new content came from) in
+    ``_cognee.source_uri``. New content without a ``source_uri`` (an upload, raw
+    text) drops the stored one, which described the old content; unchanged
+    content keeps it. A new row is built the same way, with nothing stored, so
+    every row gets one metadata shape. Stored metadata or a stored ``_cognee`` that is not a
+    dict, which older versions could write, counts as empty. Returns
+    ``(external_metadata, node_set)`` for the row.
+    """
+    kept = stored_metadata if isinstance(stored_metadata, dict) else {}
+    metadata = dict(kept) if item_external_metadata is None else {}
+    metadata.update(content_metadata)
+    if item_external_metadata:
+        metadata.update(item_external_metadata)
+
+    if source_uri or content_changed:
+        cognee_metadata = metadata.get("_cognee")
+        cognee_metadata = dict(cognee_metadata) if isinstance(cognee_metadata, dict) else {}
+        if source_uri:
+            cognee_metadata["source_uri"] = source_uri
+        else:
+            cognee_metadata.pop("source_uri", None)
+        if cognee_metadata:
+            metadata["_cognee"] = cognee_metadata
+        else:
+            metadata.pop("_cognee", None)
+
+    if node_set is None:
+        resolved_node_set = parse_node_set_names(stored_node_set) or None
+    else:
+        resolved_node_set = node_set or None
+
+    if resolved_node_set:
+        metadata["node_set"] = resolved_node_set
+    else:
+        metadata.pop("node_set", None)
+    return metadata, resolved_node_set
+
+
+def _pipeline_dataset_for(ctx, dataset_name: str | None, dataset_id: UUID | None, user: User):
     """The run's dataset from ``ctx`` when it is the one this call targets, else None.
 
     The pipeline sets ``ctx.dataset`` to the dataset it resolved (with write
@@ -80,13 +147,84 @@ INGEST_INTEGRITY_RETRY_ATTEMPTS = 5
 INGEST_INTEGRITY_RETRY_BASE_DELAY_SECONDS = 0.05
 
 
+def _source_uri_from_input(data_item: Any) -> str | None:
+    """Return an origin locator without ever treating raw text as a URI.
+
+    HTTP content is materialized into Cognee storage before metadata is read, so
+    its original URL would otherwise be lost. File and object-storage locators
+    are preserved as well; ordinary text input deliberately returns ``None``.
+    """
+    literal_text = cognee_path = False
+    if isinstance(data_item, DataItem):
+        metadata = data_item.external_metadata
+        if isinstance(metadata, dict):
+            explicit = metadata.get("source_uri")
+            if isinstance(explicit, str) and explicit.strip():
+                return explicit.strip()
+        literal_text = data_item.literal_text
+        cognee_path = data_item.cognee_path
+        data_item = data_item.data
+
+    if isinstance(data_item, str) and not literal_text:
+        parsed = urlparse(data_item)
+        if parsed.scheme.lower() in {"http", "https", "s3", "file"}:
+            return data_item
+        if not local_file_paths_accepted() and not cognee_path:
+            # Gate closed: the disk is never asked about a caller's string, so the
+            # recorded source cannot reveal whether a path exists. A path cognee
+            # produced (a cloned repository's file) is its own and keeps its source.
+            return None
+        try:
+            path = Path(data_item)
+            if path.is_absolute() or path.is_file():
+                return path.resolve().as_uri()
+        except (OSError, ValueError):
+            return None
+        return None
+
+    # A file object's ``name`` is the path it was opened with. An upload's
+    # ``filename`` is only the client's name for it, not a path on this
+    # machine, so an upload has no source location, like raw text.
+    filename = getattr(data_item, "name", None)
+    if isinstance(filename, str) and filename and not filename.startswith("<"):
+        try:
+            return Path(filename).resolve().as_uri()
+        except (OSError, ValueError):
+            return None
+    return None
+
+
+def _union_node_sets(
+    call_node_set: list[str] | None, item_node_set: list[str] | None
+) -> list[str] | None:
+    """Combine the call-level node_set with a DataItem's own node_set.
+
+    Call-first, order-preserving, deduplicated on the NodeSet id key, so two
+    spellings that map to one graph node keep only the first. With no
+    item-level node_set this returns ``call_node_set`` untouched (not even
+    deduped), exactly as before this field existed. Both sides are already
+    validated by ``ingest_data`` as lists of names.
+    """
+    if not item_node_set:
+        return call_node_set
+
+    seen: set[UUID] = set()
+    combined: list[str] = []
+    for name in (call_node_set or []) + item_node_set:
+        key = NodeSet.id_for(name)
+        if key not in seen:
+            seen.add(key)
+            combined.append(name)
+    return combined or None
+
+
 async def ingest_data(
     data: Any,
     dataset_name: str,
     user: User,
-    node_set: Optional[List[str]] = None,
-    dataset_id: UUID = None,
-    preferred_loaders: dict[str, dict[str, Any]] = None,
+    node_set: list[str] | None = None,
+    dataset_id: UUID | None = None,
+    preferred_loaders: dict[str, dict[str, Any]] | None = None,
     importance_weight: float = 0.5,
     ctx: "PipelineContext" = None,
 ):
@@ -97,12 +235,23 @@ async def ingest_data(
     this task writes to, that dataset was already resolved and write-checked by
     ``run_pipeline`` — re-resolving it here would cost three more DB sessions
     per call, and the incremental pipeline calls this task once per item.
+
+    Raises:
+        InvalidNodeSetError: If the call's node_set, a DataItem's node_set, or a
+            ``node_set`` key in a DataItem's external_metadata is not a list of
+            names. Checked before anything is stored.
     """
+    validate_node_set_names(node_set)
+    for data_item in data if isinstance(data, list) else [data]:
+        if isinstance(data_item, DataItem):
+            validate_node_set_names(data_item.node_set)
+            validate_node_set_names((data_item.external_metadata or {}).get("node_set"))
+
     if not user:
         user = await get_default_user()
 
-    def get_external_metadata_dict(data_item: Union[BinaryIO, str, Any]) -> dict[str, Any]:
-        if hasattr(data_item, "dict") and inspect.ismethod(getattr(data_item, "dict")):
+    def get_external_metadata_dict(data_item: BinaryIO | str | Any) -> dict[str, Any]:
+        if hasattr(data_item, "dict") and inspect.ismethod(data_item.dict):
             return {"metadata": data_item.dict(), "origin": str(type(data_item))}
         else:
             return {}
@@ -111,9 +260,9 @@ async def ingest_data(
         data: Any,
         dataset_name: str,
         user: User,
-        node_set: Optional[List[str]] = None,
-        dataset_id: UUID = None,
-        preferred_loaders: dict[str, dict[str, Any]] = None,
+        node_set: list[str] | None = None,
+        dataset_id: UUID | None = None,
+        preferred_loaders: dict[str, dict[str, Any]] | None = None,
     ):
         import time as _time
 
@@ -122,10 +271,11 @@ async def ingest_data(
 
         new_datapoints = []
         existing_data_points = []
-        # Originals replaced by a content-changed update: under content-
-        # addressed keys the old object is not overwritten, so it is reclaimed
-        # after the commit once nothing references it.
-        replaced_original_locations = []
+        # Stored files that re-ingested rows stop pointing at (the original and
+        # the text derived from it): a new file does not overwrite the old one
+        # unless it has the same name, so each is reclaimed after the commit
+        # once nothing references it.
+        replaced_locations = []
 
         if not isinstance(data, list):
             # Convert data to a list as we work with lists further down.
@@ -169,8 +319,8 @@ async def ingest_data(
         )
         _loop1_start = _time.monotonic()
         for data_item in data:
-            underlying_data = data_item.data if isinstance(data_item, DataItem) else data_item
             item_data_id = data_item.data_id if isinstance(data_item, DataItem) else None
+            source_uri = _source_uri_from_input(data_item)
 
             # The incremental wrapper already saved and hashed this item —
             # match by identity first; a path item whose string the in-chain
@@ -178,7 +328,8 @@ async def ingest_data(
             # its (I/O-free) save resolves to.
             carried = find_carried_source(ctx, data_item=data_item)
             if carried is None:
-                stored = await save_data_item_to_storage_detailed(underlying_data)
+                # The whole item, so DataItem.literal_text reaches the storage function.
+                stored = await save_data_item_to_storage_detailed(data_item)
                 carried = find_carried_source(ctx, file_path=stored.file_path) or stored
 
             original_file_path = carried.file_path
@@ -203,6 +354,7 @@ async def ingest_data(
                 "item_content_hash": item_content_hash,
                 "item_data_id": item_data_id,
                 "data_id": None,  # resolved below
+                "source_uri": source_uri,
             }
             unique_content_hashes.add(item_content_hash)
         logger.info(
@@ -285,17 +437,19 @@ async def ingest_data(
         for data_item in data:
             # Support for DataItem (custom label + data + optional data_id / external_metadata)
             current_label = None
-            underlying_data = data_item
             item_data_id = None
             item_external_metadata = None
             item_system_metadata = None
+            item_node_set = None
 
             if isinstance(data_item, DataItem):
-                underlying_data = data_item.data
                 current_label = data_item.label
                 item_data_id = data_item.data_id
                 item_external_metadata = data_item.external_metadata
                 item_system_metadata = data_item.system_metadata
+                item_node_set = data_item.node_set
+
+            effective_node_set = _union_node_sets(node_set, item_node_set)
 
             # Retrieve cached intermediate results from pre-loop to avoid re-processing
             cached = precomputed_items.get(id(data_item), {})
@@ -366,23 +520,23 @@ async def ingest_data(
             data_point = existing_data_map.get(str(data_id))
 
             # TODO: Maybe allow getting of external metadata through ingestion loader?
-            ext_metadata = get_external_metadata_dict(data_item)
-
-            # Merge DataItem.external_metadata if present
-            if item_external_metadata:
-                ext_metadata.update(item_external_metadata)
-
-            if node_set:
-                ext_metadata["node_set"] = node_set
+            content_metadata = get_external_metadata_dict(data_item)
+            source_uri = cached.get("source_uri")
 
             if data_point is not None:
                 # Content-change detection: reset pipeline_status when content changed
                 new_content_hash = original_file_metadata["content_hash"]
                 content_changed = str(data_point.content_hash) != str(new_content_hash)
 
-                new_original_location = original_file_metadata["file_path"]
-                if content_changed and data_point.original_data_location != new_original_location:
-                    replaced_original_locations.append(data_point.original_data_location)
+                # The row is about to point at these two files. A file it points
+                # at now and will not afterwards is released after the commit:
+                # the stored original, and the text a loader derived from it.
+                for replaced, current in (
+                    (data_point.original_data_location, original_file_metadata["file_path"]),
+                    (data_point.raw_data_location, cognee_storage_file_path),
+                ):
+                    if replaced != current:
+                        replaced_locations.append(replaced)
 
                 # Rows are dataset-scoped (the startup migration backfills
                 # legacy rows). A row of another dataset can only reach this
@@ -413,13 +567,35 @@ async def ingest_data(
                 data_point.content_hash = new_content_hash
                 data_point.raw_content_hash = storage_file_metadata["content_hash"]
                 data_point.data_size = original_file_metadata["file_size"]
-                data_point.external_metadata = ext_metadata
-                if item_system_metadata is not None:
+                # PATCH rule, see merge_existing_row_metadata: absent keeps the stored
+                # metadata and node set, an explicit empty value clears them. The
+                # node set counts as passed when the call or the item carries one;
+                # then it is their union, and an empty union clears.
+                requested_node_set = (
+                    None
+                    if node_set is None and item_node_set is None
+                    else (effective_node_set or [])
+                )
+                data_point.external_metadata, row_node_set = merge_existing_row_metadata(
+                    data_point.external_metadata,
+                    data_point.node_set,
+                    content_metadata,
+                    item_external_metadata,
+                    requested_node_set,
+                    source_uri,
+                    content_changed,
+                )
+                # System metadata is the route stamp of the CONTENT (a DLT
+                # manifest, a code file), so it follows the content: new content
+                # gets the stamp its own item carries, including none. Keeping
+                # the old stamp on a replacement of another kind would route the
+                # new content down the old route — text read as a DLT manifest —
+                # and break every later cognify of the dataset.
+                if item_system_metadata is not None or content_changed:
                     data_point.system_metadata = item_system_metadata
-                data_point.node_set = json.dumps(node_set) if node_set else None
+                data_point.node_set = json.dumps(row_node_set) if row_node_set else None
                 data_point.tenant_id = user.tenant_id if user.tenant_id else None
-                # Absent means "leave unchanged": a re-ingest without a label
-                # (current_label None) must not clear a previously stored one.
+                # Same PATCH rule for the label: absent means "leave unchanged".
                 if current_label is not None:
                     data_point.label = current_label
 
@@ -432,6 +608,16 @@ async def ingest_data(
                 if str(data_id) in dataset_data_map:
                     continue
 
+                # A new row is a re-ingest with nothing stored, so both build
+                # their metadata the same way.
+                ext_metadata, _ = merge_existing_row_metadata(
+                    None,
+                    None,
+                    content_metadata,
+                    item_external_metadata,
+                    effective_node_set,
+                    source_uri,
+                )
                 data_point = Data(
                     id=data_id,
                     dataset_id=dataset.id,
@@ -448,7 +634,7 @@ async def ingest_data(
                     raw_content_hash=storage_file_metadata["content_hash"],
                     external_metadata=ext_metadata,
                     system_metadata=item_system_metadata,
-                    node_set=json.dumps(node_set) if node_set else None,
+                    node_set=json.dumps(effective_node_set) if effective_node_set else None,
                     data_size=original_file_metadata["file_size"],
                     tenant_id=user.tenant_id if user.tenant_id else None,
                     pipeline_status={},
@@ -480,10 +666,10 @@ async def ingest_data(
             _time.monotonic() - _loop4_start,
         )
 
-        # After the commit, the updated rows point at their new originals; the
-        # replaced objects are removed unless another row still shares them.
-        for replaced_location in replaced_original_locations:
-            await db_engine.remove_data_file_if_unreferenced(replaced_location)
+        # After the commit, the updated rows point at their new files; the
+        # replaced ones are removed unless another row still shares them. A
+        # file that cannot be removed raises, saying the new content is stored.
+        await remove_unreferenced_files(replaced_locations, "The new content was stored.")
 
         _elapsed = _time.monotonic() - _store_start
         logger.info("cognee-core store_to_dataset finished in %.3f seconds", _elapsed)
@@ -499,13 +685,18 @@ async def ingest_data(
     # too. Re-read with bounded exponential backoff until the committed row is
     # visible and the existing-data path is taken. File writes are content-
     # addressed, so re-running is idempotent.
-    for attempt in range(INGEST_INTEGRITY_RETRY_ATTEMPTS):
-        try:
-            return await store_data_to_dataset(
-                data, dataset_name, user, node_set, dataset_id, preferred_loaders
-            )
-        except IntegrityError:
-            if attempt == INGEST_INTEGRITY_RETRY_ATTEMPTS - 1:
-                raise
+    #
+    # The files stored here are claimed until their rows commit, so a removal
+    # in another dataset cannot take one in between (joins the item's scope
+    # when a pipeline runs this task).
+    async with holding_stored_files():
+        for attempt in range(INGEST_INTEGRITY_RETRY_ATTEMPTS):
+            try:
+                return await store_data_to_dataset(
+                    data, dataset_name, user, node_set, dataset_id, preferred_loaders
+                )
+            except IntegrityError:
+                if attempt == INGEST_INTEGRITY_RETRY_ATTEMPTS - 1:
+                    raise
 
-            await asyncio.sleep(INGEST_INTEGRITY_RETRY_BASE_DELAY_SECONDS * (2**attempt))
+                await asyncio.sleep(INGEST_INTEGRITY_RETRY_BASE_DELAY_SECONDS * (2**attempt))

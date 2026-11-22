@@ -1,7 +1,9 @@
+from types import SimpleNamespace
 from unittest.mock import MagicMock
 
 import pytest
 
+import cognee.modules.ontology.construct_data_points_and_edges_with_ontology as ontology_module
 from cognee.modules.engine.models import Entity, EntityType
 from cognee.modules.ontology.base_ontology_resolver import BaseOntologyResolver
 from cognee.modules.ontology.construct_data_points_and_edges_with_ontology import (
@@ -9,6 +11,7 @@ from cognee.modules.ontology.construct_data_points_and_edges_with_ontology impor
     canonicalize_extracted_graphs,
     construct_data_points_and_edges_with_ontology,
 )
+from cognee.modules.ontology.exceptions import EmptyOntologyInStrictModeError
 from cognee.modules.ontology.models import AttachedOntologyNode
 from cognee.shared.data_models import Edge as KGEdge
 from cognee.shared.data_models import KnowledgeGraph, Node
@@ -184,3 +187,237 @@ def test_construct_data_points_and_edges_with_ontology_uses_the_pure_constructor
     assert widget.is_a is gadget
     assert widget.ontology_valid is True
     assert gadget.ontology_valid is True
+
+
+def _make_graph_with_ungrounded_node():
+    return KnowledgeGraph(
+        nodes=[
+            Node(id="typed-1", name="Nomatch", type="Gadget", description="class match"),
+            Node(id="named-1", name="Widget", type="Unmatched", description="individual match"),
+            Node(id="ghost-1", name="Ghost", type="Phantom", description="ungrounded"),
+        ],
+        edges=[
+            KGEdge(
+                source_node_id="named-1",
+                target_node_id="ghost-1",
+                relationship_name="haunted_by",
+            )
+        ],
+    )
+
+
+def test_strict_mode_drops_ungrounded_nodes_and_their_edges():
+    graph = _make_graph_with_ungrounded_node()
+
+    canonicalize_extracted_graphs([_make_chunk()], [graph], _StubResolver(), strict=True)
+
+    assert [node.id for node in graph.nodes] == ["typed-1", "named-1"]
+    assert graph.edges == []
+
+
+def test_annotate_mode_retains_ungrounded_nodes_and_their_edges():
+    graph = _make_graph_with_ungrounded_node()
+
+    canonicalize_extracted_graphs([_make_chunk()], [graph], _StubResolver())
+
+    assert [node.id for node in graph.nodes] == ["typed-1", "named-1", "ghost-1"]
+    assert len(graph.edges) == 1
+    assert graph.edges[0].target_node_id == "ghost-1"
+
+
+def test_construct_data_points_and_edges_with_ontology_reads_strict_mode_from_config(monkeypatch):
+    monkeypatch.setattr(
+        ontology_module,
+        "get_ontology_env_config",
+        lambda: SimpleNamespace(ontology_mode="strict"),
+    )
+    chunk = _make_chunk()
+    chunk.contains = None
+    graph = _make_graph_with_ungrounded_node()
+
+    data_points_by_id, _ = construct_data_points_and_edges_with_ontology(
+        [chunk],
+        [graph],
+        _StubResolver(),
+    )
+
+    assert str(Entity.id_for("widget_canonical")) in data_points_by_id
+    assert str(Entity.id_for("ghost")) not in data_points_by_id
+    assert [node.id for node in graph.nodes] == ["typed-1", "named-1"]
+
+
+def test_per_call_ontology_mode_overrides_env(monkeypatch):
+    monkeypatch.setattr(
+        ontology_module,
+        "get_ontology_env_config",
+        lambda: SimpleNamespace(ontology_mode="annotate"),
+    )
+    chunk = _make_chunk()
+    chunk.contains = None
+    graph = _make_graph_with_ungrounded_node()
+
+    construct_data_points_and_edges_with_ontology(
+        [chunk],
+        [graph],
+        _StubResolver(),
+        ontology_mode="strict",
+    )
+
+    assert [node.id for node in graph.nodes] == ["typed-1", "named-1"]
+
+
+class _EmptyLookupResolver(_StubResolver):
+    def __init__(self):
+        super().__init__()
+        self.lookup = {"classes": {}, "individuals": {}}
+
+
+def test_strict_mode_with_empty_ontology_lookup_raises():
+    resolver = _EmptyLookupResolver()
+    graph = _make_graph_with_ungrounded_node()
+
+    with pytest.raises(EmptyOntologyInStrictModeError):
+        canonicalize_extracted_graphs([_make_chunk()], [graph], resolver, strict=True)
+
+    # Annotate mode over the same empty resolver must keep working.
+    canonicalize_extracted_graphs([_make_chunk()], [graph], resolver)
+    assert len(graph.nodes) == 3
+
+
+def test_strict_mode_logs_one_aggregate_drop_summary(monkeypatch):
+    mock_logger = MagicMock()
+    monkeypatch.setattr(ontology_module, "logger", mock_logger)
+    graphs = [_make_graph_with_ungrounded_node(), _make_graph()]
+
+    canonicalize_extracted_graphs(
+        [_make_chunk(), _make_chunk()],
+        graphs,
+        _StubResolver(),
+        strict=True,
+    )
+
+    assert mock_logger.warning.call_count == 1
+    warning_args = mock_logger.warning.call_args[0]
+    # 1 of 4 nodes dropped, 1 of 1 edges dropped, across 2 graphs.
+    assert warning_args[1:3] == (1, 4)
+    assert warning_args[4:7] == (1, 1, 2)
+
+
+# --- closing the cognify-side match gap ---------------------------------------------
+
+
+class _LookupResolver(BaseOntologyResolver):
+    """Exposes a ``lookup`` like the RDFLib resolver and answers exact class keys only."""
+
+    def __init__(self):
+        self.lookup = {
+            "classes": {
+                "creditexposure": "https://example.test/fin#CreditExposure",
+                "enterprisecustomer": "https://example.test/fin#EnterpriseCustomer",
+            },
+            "individuals": {},
+        }
+        self.calls = []
+
+    def build_lookup(self) -> None:
+        return None
+
+    def refresh_lookup(self) -> None:
+        return None
+
+    def find_closest_match(self, name: str, category: str):
+        return name if name in self.lookup.get(category, {}) else None
+
+    def get_subgraph(self, node_name: str, node_type: str = "individuals", directed: bool = True):
+        self.calls.append((node_type, node_name))
+        if node_type == "classes":
+            # A deliberately loose match, like the 80% fuzzy cutoff makes on n-grams.
+            if node_name == "enterprise_customer_acme":
+                root = AttachedOntologyNode(self.lookup["classes"]["enterprisecustomer"], "classes")
+                return [root], [], root
+            uri = self.lookup["classes"].get(node_name)
+            if uri is not None:
+                root = AttachedOntologyNode(uri, "classes")
+                return [root], [], root
+        return [], [], None
+
+
+def test_entity_named_after_a_class_is_grounded_in_it_when_its_type_is_not():
+    resolver = _LookupResolver()
+    chunk = _make_chunk()
+    graph = KnowledgeGraph(
+        nodes=[
+            Node(
+                id="n1",
+                name="Credit exposure to Acme Corporation",
+                type="Financial Metric",
+                description="",
+            ),
+            Node(id="n2", name="Customer feedback form", type="Document", description=""),
+        ],
+        edges=[],
+    )
+
+    data_points_by_id, _ = construct_data_points_and_edges_with_ontology(
+        [chunk], [graph], resolver, ontology_mode="annotate"
+    )
+
+    grounded = data_points_by_id[str(EntityType.id_for("CreditExposure"))]
+    assert grounded.ontology_valid is True
+    entity = data_points_by_id[str(Entity.id_for("credit exposure to acme corporation"))]
+    assert entity.is_a.id == grounded.id
+    # "form" is the head noun of the second name; no class matches, type stays as extracted.
+    other = data_points_by_id[str(Entity.id_for("customer feedback form"))]
+    assert other.is_a.name == "document"
+
+
+def test_unsound_multiword_fuzzy_class_match_is_rejected():
+    resolver = _LookupResolver()
+    chunk = _make_chunk()
+    graph = KnowledgeGraph(
+        nodes=[Node(id="n1", name="Acme", type="Enterprise Customer Acme", description="")],
+        edges=[],
+    )
+
+    data_points_by_id, _ = construct_data_points_and_edges_with_ontology(
+        [chunk], [graph], resolver, ontology_mode="annotate"
+    )
+
+    # The fuzzy hit dragged "acme" into a class match; the soundness rule drops it and
+    # the extracted type survives untouched.
+    assert str(EntityType.id_for("EnterpriseCustomer")) not in data_points_by_id
+    assert data_points_by_id[str(Entity.id_for("acme"))].is_a.name == "enterprise customer acme"
+
+
+def _same_name_two_types(first_type: str, second_type: str) -> list[KnowledgeGraph]:
+    """One name in two chunks, typed differently; each chunk links it to a customer."""
+    graphs = []
+    for index, node_type in enumerate((first_type, second_type)):
+        exposure = Node(
+            id=f"e{index}", name="Credit exposure to Acme", type=node_type, description=""
+        )
+        acme = Node(id=f"a{index}", name="Acme", type="EnterpriseCustomer", description="")
+        edge = KGEdge(
+            source_node_id=exposure.id, target_node_id=acme.id, relationship_name="owed_by"
+        )
+        graphs.append(KnowledgeGraph(nodes=[exposure, acme], edges=[edge]))
+    return graphs
+
+
+@pytest.mark.parametrize(
+    "types", [("CreditExposure", "Financial Metric"), ("Financial Metric", "CreditExposure")]
+)
+def test_name_based_class_match_does_not_depend_on_chunk_order(types):
+    graphs = _same_name_two_types(*types)
+    canonicalize_extracted_graphs(
+        [_make_chunk(), _make_chunk()], graphs, _LookupResolver(), strict=False
+    )
+    assert [graph.nodes[0].type for graph in graphs] == ["CreditExposure", "CreditExposure"]
+
+    graphs = _same_name_two_types(*types)
+    canonicalize_extracted_graphs(
+        [_make_chunk(), _make_chunk()], graphs, _LookupResolver(), strict=True
+    )
+    for graph in graphs:
+        assert graph.nodes[0].name == "Credit exposure to Acme"
+        assert len(graph.edges) == 1

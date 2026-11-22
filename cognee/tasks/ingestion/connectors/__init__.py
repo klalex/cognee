@@ -1,20 +1,54 @@
-"""SaaS data-source connectors for cognee.
+"""SDK-bundled data sources for incremental, deletion-aware ingestion.
 
-Connectors that pull an external source (Gmail, Slack, Notion, Google Drive,
-Confluence, …) into cognee memory are distributed as **separate community
-packages** under https://github.com/topoteretes/cognee-community
-(``cognee-community-connector-<source>``), so core stays free of per-source SDKs.
-
-Each connector is a plain ``dlt`` source you hand to ``cognee.remember(...)``. It
-reuses core's DLT ingestion path (``resolve_dlt_sources`` -> ``ingest_dlt_source``
--> ``orphan_cleanup``) for incremental re-sync and forget-on-source-deletion, and
-opts into the document ingestion path via ``dlt_utils.DOCUMENT_SOURCE_ATTR``. No
-connector is bundled in core::
-
-    pip install cognee-community-connector-gmail
-    from cognee_community_connector_gmail import gmail_source
-
-    await cognee.remember(gmail_source(...), dataset_name="gmail_inbox")
+Install ``cognee[gmail]``, ``cognee[google-drive]`` or ``cognee[google-calendar]`` for the
+Google dependencies and ``cognee[evernote]`` for Evernote's Thrift client; the Apollo, Asana,
+Dropbox, Linear, Notion, Obsidian, OneNote, Slack, Telegram and Vercel sources need none.
+Importing this package does not load DLT or client libraries, authenticate, or start ingestion.
+Other connectors remain available in cognee-community.
 """
 
-__all__: list[str] = []
+from .apollo import apollo_source, build_apollo_service
+from .asana import asana_source, build_asana_service
+from .dropbox import build_dropbox_service, dropbox_account_id, dropbox_source
+from .evernote import build_evernote_service, evernote_source
+from .gmail import build_gmail_service_from_access_token, gmail_source
+from .google_calendar import build_calendar_service_from_access_token, google_calendar_source
+from .google_drive import build_drive_service_from_access_token, google_drive_source
+from .linear import build_linear_service, linear_source
+from .notion import notion_source
+from .obsidian import obsidian_source
+from .onenote import list_onenote_notebooks, onenote_source
+from .slack import build_slack_service, slack_source
+from .telegram import build_telegram_service, telegram_account_id, telegram_source
+from .vercel import build_vercel_service, vercel_source
+
+__all__ = [
+    "apollo_source",
+    "asana_source",
+    "build_apollo_service",
+    "build_asana_service",
+    "build_calendar_service_from_access_token",
+    "build_drive_service_from_access_token",
+    "build_dropbox_service",
+    "build_evernote_service",
+    "build_gmail_service_from_access_token",
+    "build_linear_service",
+    "build_slack_service",
+    "build_telegram_service",
+    "build_vercel_service",
+    "dropbox_account_id",
+    "dropbox_source",
+    "evernote_source",
+    "gmail_source",
+    "google_calendar_source",
+    "google_drive_source",
+    "linear_source",
+    "list_onenote_notebooks",
+    "notion_source",
+    "obsidian_source",
+    "onenote_source",
+    "slack_source",
+    "telegram_account_id",
+    "telegram_source",
+    "vercel_source",
+]

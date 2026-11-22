@@ -1,9 +1,11 @@
+import builtins
+from collections.abc import AsyncGenerator
 from io import StringIO
-from typing import Any, AsyncGenerator
+from typing import Any
 
+from cognee.infrastructure.files.utils.open_data_file import open_data_file
 from cognee.modules.chunking.Chunker import Chunker
 from cognee.modules.data.exceptions import UnstructuredLibraryImportError
-from cognee.infrastructure.files.utils.open_data_file import open_data_file
 
 from .Document import Document
 
@@ -11,7 +13,9 @@ from .Document import Document
 class UnstructuredDocument(Document):
     type: str = "unstructured"
 
-    async def read(self, chunker_cls: Chunker, max_chunk_size: int) -> AsyncGenerator[Any, Any]:
+    async def read(
+        self, chunker_cls: builtins.type[Chunker], max_chunk_size: int
+    ) -> AsyncGenerator[Any, Any]:
         async def get_text():
             try:
                 from unstructured.partition.auto import partition

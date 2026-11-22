@@ -1,6 +1,7 @@
 """Prepare edges for graph storage by ensuring each has default edge properties."""
 
-from typing import Any, Dict, Iterable, List, Tuple
+from collections.abc import Iterable
+from typing import Any
 
 from cognee.modules.engine.utils import generate_edge_object_id
 from cognee.shared.logging_utils import get_logger
@@ -24,7 +25,11 @@ def _get_nonblank_text(value: Any) -> str | None:
 
 
 def get_edge_retrieval_text(edge_text: Any, relationship_name: Any) -> str:
-    """Return the edge text used for retrieval, falling back to relationship_name."""
+    """Return the edge text used for retrieval, falling back to relationship_name.
+
+    The Postgres graph adapter narrows edges by this text in SQL
+    (``find_edge_texts_in_use``): a change to the rule here has to be made there too.
+    """
     return _get_nonblank_text(edge_text) or _get_nonblank_text(relationship_name) or ""
 
 
@@ -98,9 +103,9 @@ def _build_fallback_edge_text(
 
 
 def ensure_default_edge_properties(
-    edges: List[Tuple[str, str, str, Dict[str, Any]]],
+    edges: list[tuple[str, str, str, dict[str, Any]]],
     nodes: Iterable[Any] | None = None,
-) -> List[Tuple[str, str, str, Dict[str, Any]]]:
+) -> list[tuple[str, str, str, dict[str, Any]]]:
     """
     Ensure each edge has all default properties and retrieval text.
     Returns a new list of edges; does not mutate the input.

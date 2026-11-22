@@ -1,22 +1,36 @@
-from cognee.shared.logging_utils import get_logger
+from collections.abc import Callable
 from os.path import basename
 from uuid import NAMESPACE_OID, uuid5
 
-from cognee.tasks.chunks import chunk_by_paragraph
+from cognee.infrastructure.utils.run_cpu_bound import run_cpu_bound
 from cognee.modules.chunking.Chunker import Chunker
+from cognee.shared.logging_utils import get_logger
+from cognee.tasks.chunks import chunk_by_paragraph
+
 from .models.DocumentChunk import DocumentChunk
 
 logger = get_logger()
 
 
+def _collect_chunk_data(get_chunk_data: Callable, text: str) -> list[dict]:
+    """Call get_chunk_data and copy each record, on the CPU worker.
+
+    The call happens here so an eager callback's work also leaves the event loop, and
+    each record is copied because a custom generator may reuse one dict between yields.
+    """
+    return [dict(record) for record in get_chunk_data(text)]
+
+
 class TextChunkerWithOverlap(Chunker):
+    chunker_id = "text_chunker_overlap_v1"
+
     def __init__(
         self,
         document,
-        get_text: callable,
+        get_text: Callable,
         max_chunk_size: int,
         chunk_overlap_ratio: float = 0.0,
-        get_chunk_data: callable = None,
+        get_chunk_data: Callable | None = None,
     ):
         super().__init__(document, get_text, max_chunk_size)
         self.document_name = document.name or basename(document.raw_data_location)
@@ -71,7 +85,8 @@ class TextChunkerWithOverlap(Chunker):
         """Create a DocumentChunk with standard metadata."""
         try:
             return DocumentChunk(
-                id=chunk_id or uuid5(NAMESPACE_OID, f"{str(self.document.id)}-{self.chunk_index}"),
+                chunker_id=self.chunker_id,
+                id=chunk_id or uuid5(NAMESPACE_OID, f"{self.document.id!s}-{self.chunk_index}"),
                 text=text,
                 chunk_size=size,
                 is_part_of=self.document,
@@ -80,11 +95,12 @@ class TextChunkerWithOverlap(Chunker):
                 contains=[],
                 document_id=str(self.document.id),
                 document_name=self.document_name,
+                importance_weight=self.document.importance_weight,
                 metadata={"index_fields": ["text"]},
             )
         except Exception as e:
             logger.error(e)
-            raise e
+            raise
 
     def _create_chunk_from_accumulation(self):
         """Create a DocumentChunk from current accumulated chunk_data."""
@@ -115,7 +131,12 @@ class TextChunkerWithOverlap(Chunker):
 
     async def read(self):
         async for content_text in self.get_text():
-            for chunk_data in self.get_chunk_data(content_text):
+            # Same as TextChunker: the default get_chunk_data counts tokens word by word, so
+            # it is called and consumed on the shared CPU worker and the event loop stays free.
+            chunk_data_list = await run_cpu_bound(
+                _collect_chunk_data, self.get_chunk_data, content_text
+            )
+            for chunk_data in chunk_data_list:
                 if not self._accumulation_overflows(chunk_data):
                     self._accumulate_chunk_data(chunk_data)
                     continue

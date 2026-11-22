@@ -1,8 +1,11 @@
 from contextlib import contextmanager
 
 from cognee.context_global_variables import (
-    llm_config as llm_config_ctx,
+    current_caller,
     current_pipeline_stage,
+)
+from cognee.context_global_variables import (
+    llm_config as llm_config_ctx,
 )
 from cognee.infrastructure.llm.config import get_llm_context_config
 
@@ -22,3 +25,17 @@ def pipeline_stage(stage: str):
     finally:
         current_pipeline_stage.reset(stage_token)
         llm_config_ctx.reset(cfg_token)
+
+
+@contextmanager
+def caller_scope(name: str):
+    """Name the cognee work the LLM calls made within this block belong to.
+
+    Sets only the caller; the model settings and the stage are untouched. The
+    nearest scope wins, and the previous caller is restored on exit.
+    """
+    token = current_caller.set(name)
+    try:
+        yield
+    finally:
+        current_caller.reset(token)

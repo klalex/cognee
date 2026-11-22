@@ -4,15 +4,23 @@ A trace step records one agent method call. Its ``session_feedback`` is a one-li
 summary of what the step did — generated from the step's return value via an LLM, or
 falling back to a deterministic success/failure line. Storage of trace steps stays in
 ``SessionManager``; only this summary logic lives here.
+
+The LLM summary is a per-tool-call cost. ``SessionManager.add_agent_trace_step`` requests
+it only when the caller asked for it (``@agent_memory(session_trace_summary=True)``, off by
+default) *and* automatic feedback analysis is enabled (``AUTO_FEEDBACK``); every other
+step takes ``fallback_agent_trace_feedback``. The batch extraction in ``improve()`` reads
+the stored return value itself, so the summary is a convenience, never the record.
 """
 
 import json
 from typing import Any
 
 from cognee.infrastructure.llm.LLMGateway import LLMGateway
+from cognee.infrastructure.llm.pipeline_stage import caller_scope
 from cognee.infrastructure.llm.prompts import read_query_prompt
 from cognee.infrastructure.session.feedback_models import AgentTraceFeedbackSummary
 from cognee.modules.agent_memory.sanitization import sanitize_value
+from cognee.modules.preflight import llm_available
 from cognee.shared.logging_utils import get_logger
 
 logger = get_logger("session_agent_trace")
@@ -54,6 +62,10 @@ async def generate_agent_trace_feedback(
 
     if method_return_value is None:
         return fallback_feedback
+    if not llm_available():
+        # Keyless setups have nothing to summarize with; the fallback line is
+        # the answer, without building an LLM client that raises and logs.
+        return fallback_feedback
 
     try:
         system_prompt = read_query_prompt("agent_trace_feedback_summary_system.txt")
@@ -64,17 +76,18 @@ async def generate_agent_trace_feedback(
         sanitized_return_value = sanitize_value(method_return_value)
         serialized_return_value = json.dumps(sanitized_return_value, ensure_ascii=False)
 
-        result = await LLMGateway.acreate_structured_output(
-            text_input=serialized_return_value,
-            system_prompt=system_prompt,
-            response_model=AgentTraceFeedbackSummary,
-        )
+        with caller_scope("generate_agent_trace_feedback"):
+            result = await LLMGateway.acreate_structured_output(
+                text_input=serialized_return_value,
+                system_prompt=system_prompt,
+                response_model=AgentTraceFeedbackSummary,
+            )
         session_feedback = result.session_feedback.strip()
         return session_feedback if session_feedback else fallback_feedback
     except Exception as e:
         logger.warning(
             "Agent trace feedback generation failed, using fallback: %s",
             e,
-            exc_info=False,
+            exc_info=True,
         )
         return fallback_feedback

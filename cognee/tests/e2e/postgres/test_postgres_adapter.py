@@ -9,15 +9,27 @@ Override via environment variables if needed.
 
 import asyncio
 import os
+from contextlib import contextmanager
 from copy import deepcopy
 from uuid import uuid4
 
 import pytest
 import pytest_asyncio
+from sqlalchemy import event, text
 
-from cognee.infrastructure.databases.graph.postgres_demo.adapter import PostgresDemoAdapter
-from cognee.infrastructure.databases.provenance import EdgeIdentity, make_source_ref_key
-
+from cognee.infrastructure.databases.graph.graph_db_interface import GraphDBInterface
+from cognee.infrastructure.databases.graph.postgres_demo.adapter import (
+    PostgresDemoAdapter,
+    _python_whitespace,
+)
+from cognee.infrastructure.databases.provenance import (
+    EdgeIdentity,
+    make_chunk_source_ref_key,
+    make_source_ref_key,
+)
+from cognee.tests.utils.assert_bounded_neighborhood_contract import (
+    assert_bounded_neighborhood_contract,
+)
 
 # -- Session-scoped event loop so the async engine's connection pool
 #    stays on a single loop across all tests.
@@ -490,7 +502,7 @@ async def test_get_connections(adapter):
 
     connections = await adapter.get_connections("cn1")
     assert len(connections) == 1
-    src, edge, tgt = connections[0]
+    _src, edge, _tgt = connections[0]
     assert edge["relationship_name"] == "LINKED"
 
 
@@ -807,3 +819,469 @@ async def test_get_triplets_batch_validation(adapter):
 async def test_query_raises_not_implemented(adapter):
     with pytest.raises(NotImplementedError):
         await adapter.query("MATCH (n) RETURN n")
+
+
+@pytest.mark.asyncio
+async def test_degree_seeds_cover_empty_isolated_and_bidirectional_graphs(adapter):
+    from unittest.mock import AsyncMock
+
+    adapter.get_graph_data = AsyncMock(side_effect=AssertionError("unexpected full graph read"))
+    assert await adapter.get_top_degree_node_ids(5) == []
+    await adapter.add_nodes(
+        [_FakeDataPoint(id=n) for n in ["hub", "incoming", "outgoing", "isolated"]]
+    )
+    # Exercises the intentionally empty ANY(:seed_ids) binding with asyncpg.
+    assert set(await adapter.get_top_degree_node_ids(5)) == {
+        "hub",
+        "incoming",
+        "outgoing",
+        "isolated",
+    }
+    await adapter.add_edge("incoming", "hub", "rel")
+    await adapter.add_edge("hub", "outgoing", "rel")
+    assert await adapter.get_top_degree_node_ids(1) == ["hub"]
+    seeds = await adapter.get_top_degree_node_ids(5)
+    assert seeds[0] == "hub"
+    assert set(seeds) == {"hub", "incoming", "outgoing", "isolated"}
+    adapter.get_graph_data.assert_not_awaited()
+
+
+# -- Tests: bounded neighbourhood (SDK-786) --
+
+
+async def _two_hub_graph(adapter, spokes=30):
+    """Two hubs with their own spokes, one spoke of each linked to a shared tail."""
+    nodes = [("hub-a", {"name": "a", "type": "Hub"}), ("hub-b", {"name": "b", "type": "Hub"})]
+    edges = []
+    for hub in ("a", "b"):
+        for index in range(spokes):
+            spoke = f"{hub}-{index}"
+            nodes.append((spoke, {"name": spoke, "type": "Spoke", "text": "x" * 200}))
+            edges.append((f"hub-{hub}", spoke, "has", {}))
+    nodes.append(("tail", {"name": "tail", "type": "Tail"}))
+    edges += [("a-0", "tail", "next", {}), ("tail", "b-0", "next", {})]
+    await adapter.add_nodes(nodes)
+    await adapter.add_edges(edges)
+    return nodes, edges
+
+
+async def _bounded_chunks(adapter, *args, **kwargs):
+    return [chunk async for chunk in adapter.iter_bounded_neighborhood(*args, **kwargs)]
+
+
+@pytest.mark.asyncio
+async def test_bounded_neighborhood_shares_the_budget_between_hubs(adapter):
+    from unittest.mock import AsyncMock
+
+    _, edges = await _two_hub_graph(adapter)
+    adapter.get_neighborhood = AsyncMock(side_effect=AssertionError("unbounded read"))
+
+    chunks = await _bounded_chunks(adapter, ["hub-a", "hub-b"], 2, 22, chunk_size=5)
+
+    members, _ = assert_bounded_neighborhood_contract(
+        chunks, max_nodes=22, chunk_size=5, seed_ids=["hub-a", "hub-b"], graph_edges=edges
+    )
+    assert len(members) == 22
+    per_hub = {hub: sum(member.startswith(f"{hub}-") for member in members) for hub in "ab"}
+    assert per_hub == {"a": 10, "b": 10}  # round robin, not whichever hub the scan hit first
+    assert "tail" not in members
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("depth", [1, 2])
+async def test_bounded_neighborhood_matches_get_neighborhood_when_the_budget_is_larger(
+    adapter, depth
+):
+    _, edges = await _two_hub_graph(adapter, spokes=5)
+    reference_nodes, reference_edges = await adapter.get_neighborhood(["hub-a"], depth=depth)
+
+    chunks = await _bounded_chunks(adapter, ["hub-a"], depth, 10_000, chunk_size=3)
+
+    members, identities = assert_bounded_neighborhood_contract(
+        chunks, max_nodes=10_000, chunk_size=3, seed_ids=["hub-a"], graph_edges=edges
+    )
+    assert set(members) == {node_id for node_id, _ in reference_nodes}
+    assert identities == {(s, t, r) for s, t, r, _ in reference_edges}
+    full = {node_id: data for nodes, _ in chunks for node_id, data in nodes}
+    assert full == {node_id: data for node_id, data in reference_nodes}
+
+
+@pytest.mark.asyncio
+async def test_bounded_neighborhood_seed_handling(adapter):
+    """Isolated seeds come back alone; missing and repeated seeds take no slot."""
+    await adapter.add_nodes(
+        [
+            ("alone", {"name": "alone", "type": "T"}),
+            ("b", {"name": "b", "type": "T"}),
+            *[(f"n{index}", {"name": str(index), "type": "T"}) for index in range(5)],
+        ]
+    )
+    await adapter.add_edges([("b", f"n{index}", "rel", {}) for index in range(5)])
+
+    assert await _bounded_chunks(adapter, ["alone"], 2, 10) == [
+        ([("alone", {"name": "alone", "type": "T"})], [])
+    ]
+
+    chunks = await _bounded_chunks(adapter, ["b", "missing", "alone", "b"], 1, 4)
+    members, _ = assert_bounded_neighborhood_contract(
+        chunks, max_nodes=4, chunk_size=2000, seed_ids=["b", "alone"]
+    )
+    assert len(members) == 4
+
+
+@pytest.mark.asyncio
+async def test_bounded_neighborhood_accepts_uuid_seeds(adapter):
+    seed = uuid4()
+    await adapter.add_nodes([(str(seed), {"name": "u", "type": "T"}), ("n", {"name": "n"})])
+    await adapter.add_edges([(str(seed), "n", "rel", {})])
+
+    chunks = await _bounded_chunks(adapter, [seed], 1, 10)
+
+    members, identities = assert_bounded_neighborhood_contract(
+        chunks, max_nodes=10, chunk_size=2000, seed_ids=[str(seed)]
+    )
+    assert members == [str(seed), "n"]
+    assert identities == {(str(seed), "n", "rel")}
+
+
+@pytest.mark.asyncio
+async def test_bounded_neighborhood_projects_properties_in_sql(adapter):
+    await adapter.add_nodes(
+        [("p", {"name": "p", "type": "T", "text": "long " * 500, "belongs_to_set": ["s"]})]
+    )
+
+    ((nodes, _),) = await _bounded_chunks(adapter, ["p"], 1, 10, property_keys=["belongs_to_set"])
+
+    assert nodes == [("p", {"name": "p", "type": "T", "belongs_to_set": ["s"]})]
+
+
+@pytest.mark.asyncio
+async def test_bounded_neighborhood_skips_a_node_deleted_between_chunks(adapter):
+    await _two_hub_graph(adapter, spokes=6)
+    stream = adapter.iter_bounded_neighborhood(["hub-a"], 1, 100, chunk_size=3)
+
+    first = await stream.__anext__()
+    await adapter.delete_node("a-5")  # sits in a later chunk
+    rest = [chunk async for chunk in stream]
+
+    members, identities = assert_bounded_neighborhood_contract(
+        [first, *rest], max_nodes=100, chunk_size=3, seed_ids=["hub-a"]
+    )
+    assert "a-5" not in members
+    assert all("a-5" not in identity for identity in identities)
+    assert len(members) == 6
+
+
+@pytest.mark.asyncio
+async def test_bounded_neighborhood_is_stable_across_generic_plan_switches(adapter):
+    """Prepared statements switch to a generic plan after five executions.
+
+    The result must not depend on which plan runs, so read it more often than
+    that on one pool and compare. Each hub has more spokes than the budget, so
+    the per-node LIMIT cuts and the same spokes have to survive every read.
+    """
+    await _two_hub_graph(adapter, spokes=30)
+
+    results = [
+        await _bounded_chunks(adapter, ["hub-a", "hub-b"], 2, 12, chunk_size=4) for _ in range(8)
+    ]
+
+    assert all(result == results[0] for result in results)
+
+
+# -- Tests: streamed visualization (SDK-787) --
+
+
+@pytest.mark.asyncio
+async def test_streamed_graph_matches_preprocess_and_never_sends_text(adapter):
+    import json
+
+    from cognee.modules.visualization.graph_stream import begin_graph_stream, stream_graph_events
+    from cognee.modules.visualization.preprocessor import COMPACT_PROPERTY_KEYS, preprocess
+
+    await adapter.add_nodes(
+        [("hub", {"name": "hub", "type": "Entity", "source_node_set": "docs"})]
+        + [
+            (f"chunk-{index}", {"type": "DocumentChunk", "text": f"chunk {index} " * 400})
+            for index in range(30)
+        ]
+    )
+    await adapter.add_edges([("hub", f"chunk-{index}", "contains", {}) for index in range(30)])
+    await adapter.add_edges([("chunk-0", "chunk-1", "next", {})])
+
+    requested = []
+    native = adapter.iter_bounded_neighborhood
+
+    def spy(*args, **kwargs):
+        requested.append(kwargs.get("property_keys"))
+        return native(*args, **kwargs)
+
+    adapter.iter_bounded_neighborhood = spy
+
+    stream = await begin_graph_stream(
+        stream_graph_events(
+            adapter,
+            query=None,
+            seed_node_ids=["hub"],
+            neighborhood_depth=1,
+            seed_top_k=10,
+            max_nodes=100,
+            chunk_size=8,
+        )
+    )
+    frames = [frame async for frame in stream.frames()]
+    events = [
+        (lines[0][7:], json.loads(lines[1][6:]))
+        for lines in (frame.strip().splitlines() for frame in frames if frame.startswith("event"))
+    ]
+
+    assert [name for name, _ in events][:2] == ["meta", "chunk"]
+    assert [name for name, _ in events][-2:] == ["summary", "done"]
+    assert requested == [list(COMPACT_PROPERTY_KEYS)]  # projected in SQL, not in Python
+
+    sent, links = {}, []
+    for name, data in events:
+        if name == "chunk":
+            for node in data["nodes"]:
+                sent[node["id"]] = node
+            for link in data["links"]:
+                assert link["source"] in sent and link["target"] in sent
+                links.append(link)
+    assert all("text" not in node for node in sent.values())
+    assert len(json.dumps([data for name, data in events if name == "chunk"])) < 20_000
+
+    reference = preprocess(await adapter.get_neighborhood(["hub"], depth=1))
+    by_id = {node["id"]: node for node in reference.nodes}
+    assert {node_id: node["name"] for node_id, node in sent.items()} == {
+        node_id: node["name"] for node_id, node in by_id.items()
+    }
+    summaries = [data for name, data in events if name == "summary"]
+    summary = {
+        "nodes": {k: v for part in summaries for k, v in part["nodes"].items()},
+        "color_maps": summaries[0]["color_maps"],
+    }
+    assert all(len(part["nodes"]) <= 8 for part in summaries)
+    assert summary["nodes"] == {
+        node_id: {"importance": node["importance"], "label_priority": node["label_priority"]}
+        for node_id, node in by_id.items()
+    }
+    assert summary["color_maps"]["node_set"] == reference.color_maps["node_set"]
+    assert len(links) == len(reference.links)
+
+
+@pytest.mark.asyncio
+async def test_entity_type_names_reads_one_is_a_hop(adapter):
+    """SDK-794: the native lookup maps entities to their EntityType, never outward."""
+    for node_id, name, node_type in [
+        ("alice", "Alice", "Entity"),
+        ("bob", "Bob", "Entity"),
+        ("carol", "Carol", "Entity"),
+        ("person", "Person", "EntityType"),
+    ]:
+        await adapter.add_node(_FakeDataPoint(id=node_id, name=name, type=node_type))
+    await adapter.add_edge("alice", "person", "is_a")
+    await adapter.add_edge("bob", "person", "is_a")
+    await adapter.add_edge("alice", "bob", "knows")
+
+    assert await adapter.get_entity_type_names(["alice", "bob", "carol"]) == {
+        "alice": "Person",
+        "bob": "Person",
+    }
+    assert await adapter.get_entity_type_names(["person"]) == {}
+    assert await adapter.get_entity_type_names([]) == {}
+
+
+@pytest.mark.asyncio
+async def test_source_refs_by_data_take_the_key_literally(adapter):
+    """Issue 6791: one document's refs are selected in the database. ``_`` is a LIKE
+    wildcard and every key has one, so a row that differs from the document's chunk
+    keys only where the pattern has ``_`` must not come back."""
+    dataset, data = uuid4(), uuid4()
+    document_key = make_source_ref_key(dataset, data)
+    chunk_key = make_chunk_source_ref_key(dataset, data, uuid4())
+    other_document_key = make_source_ref_key(dataset, uuid4())
+    for node_id in ("document", "chunk", "other", "lookalike"):
+        await adapter.add_node(_FakeDataPoint(id=node_id, name=node_id, type="Entity"))
+    await adapter.add_edge("document", "chunk", "has_chunk")
+    await adapter.add_edge("other", "chunk", "mentions")
+    await adapter.attach_node_source_refs(["document"], [other_document_key, document_key])
+    await adapter.attach_node_source_refs(["chunk"], [chunk_key])
+    await adapter.attach_node_source_refs(["other"], [other_document_key])
+    await adapter.attach_edge_source_refs(
+        [EdgeIdentity("document", "chunk", "has_chunk")], [chunk_key]
+    )
+    await adapter.attach_edge_source_refs(
+        [EdgeIdentity("other", "chunk", "mentions")], [other_document_key]
+    )
+    # Not a key cognee writes: "source_ref" with its "_" replaced, which only an
+    # unescaped LIKE pattern would match.
+    async with adapter.engine.begin() as connection:
+        await connection.execute(
+            text(
+                "INSERT INTO graph_node_source_ref (node_id, source_ref_key, dataset_id) "
+                "VALUES ('lookalike', :key, :dataset)"
+            ),
+            {"key": chunk_key.replace("source_ref", "sourceXref"), "dataset": str(dataset)},
+        )
+
+    assert await adapter.find_node_source_refs_by_data(str(dataset), str(data)) == {
+        "document": [document_key],
+        "chunk": [chunk_key],
+    }
+    assert await adapter.find_edge_source_refs_by_data(str(dataset), str(data)) == {
+        EdgeIdentity("document", "chunk", "has_chunk"): [chunk_key]
+    }
+    assert await adapter.find_node_source_refs_by_data(str(dataset), str(uuid4())) == {}
+
+
+@contextmanager
+def _executed_statements(adapter):
+    """The SQL the adapter's engine runs inside the block."""
+    statements: list[str] = []
+
+    def record(connection, cursor, statement, parameters, context, executemany):
+        statements.append(statement)
+
+    event.listen(adapter.engine.sync_engine, "before_cursor_execute", record)
+    try:
+        yield statements
+    finally:
+        event.remove(adapter.engine.sync_engine, "before_cursor_execute", record)
+
+
+def _narrowed_by_text(statements: list[str]) -> bool:
+    """Whether a statement selected edges by their text in the database."""
+    return any("btrim(" in statement for statement in statements)
+
+
+@pytest.mark.asyncio
+async def test_edge_texts_in_use_agree_with_reading_every_edge(adapter):
+    """Issue 6791: the database narrows the edges and must not lose one whose text
+    ``get_edge_retrieval_text`` computes: every whitespace ``str.strip()`` removes,
+    blank and absent ``edge_text``, and ``edge_text`` values that are not strings."""
+    every_whitespace = _python_whitespace()
+    assert len(every_whitespace) > 20 and "\u00a0" in every_whitespace
+    stored_edge_texts = [
+        "plain text",
+        f"{every_whitespace}padded with every whitespace{every_whitespace}",
+        "\u00a0non breaking spaces\u2003",
+        "\x1funit separators\x1c",
+        "inner  spaces\tstay",
+        "café, voilà, très",
+        "日本語のテキスト",
+        "",
+        "   ",
+        every_whitespace,
+        None,
+        5,
+        1.5,
+        True,
+        False,
+        ["a", "list"],
+        {"a": "dict"},
+    ]
+    await adapter.add_node(_FakeDataPoint(id="hub", name="hub", type="Entity"))
+    for index, edge_text in enumerate(stored_edge_texts):
+        node_id = f"n{index}"
+        await adapter.add_node(_FakeDataPoint(id=node_id, name=node_id, type="Entity"))
+        # Some relationship names carry padding of their own, for the fallback.
+        relationship_name = f"\u2003rel_{index}\n" if index % 5 == 0 else f"rel_{index}"
+        await adapter.add_edge("hub", node_id, relationship_name, {"edge_text": edge_text})
+    await adapter.add_node(_FakeDataPoint(id="bare", name="bare", type="Entity"))
+    await adapter.add_edge("hub", "bare", "créé")
+    # More edges than texts asked below, so the adapter narrows in the database.
+    for index in range(40):
+        node_id = f"filler{index}"
+        await adapter.add_node(_FakeDataPoint(id=node_id, name=node_id, type="Entity"))
+        await adapter.add_edge("hub", node_id, "filler", {"edge_text": f"filler text {index}"})
+
+    _, edges = await adapter.get_graph_data()
+    assert len(edges) == len(stored_edge_texts) + 41
+    from cognee.modules.graph.utils.prepare_edges_for_storage import get_edge_retrieval_text
+
+    texts = {
+        get_edge_retrieval_text(edge[3].get("edge_text"), edge[2])
+        for edge in edges
+        if edge[2] != "filler"
+    }
+    assert {"plain text", "padded with every whitespace", "non breaking spaces"} <= texts
+    assert {"café, voilà, très", "日本語のテキスト", "créé"} <= texts
+    assert {"5", "1.5", "True", "False", "rel_10", "rel_7", "rel_8", "rel_9"} <= texts
+
+    absent = ["rel_0", "rel_1", "plain", "true", "a", " plain text", "nobody has this"]
+    asked = sorted(texts) + absent
+    assert len(asked) < len(edges)
+    with _executed_statements(adapter) as statements:
+        in_use = await adapter.find_edge_texts_in_use(asked)
+    assert _narrowed_by_text(statements)
+    assert in_use == texts
+    assert in_use == await GraphDBInterface.find_edge_texts_in_use(adapter, asked)
+    # Asking for one text at a time finds the same edges as asking for all.
+    for edge_text in asked:
+        assert await adapter.find_edge_texts_in_use([edge_text]) == {edge_text} & texts
+    assert await adapter.find_edge_texts_in_use([]) == set()
+
+
+@pytest.mark.asyncio
+async def test_edge_texts_in_use_reads_the_remaining_edges_when_more_texts_are_asked(adapter):
+    """After a whole dataset is deleted, millions of texts are asked about and few
+    edges are left: the adapter reads those edges and does not send every text."""
+    for node_id in ("a", "b", "c"):
+        await adapter.add_node(_FakeDataPoint(id=node_id, name=node_id, type="Entity"))
+    await adapter.add_edge("a", "b", "knows", {"edge_text": "  a knows b "})
+    await adapter.add_edge("b", "c", "likes")
+    asked = ["a knows b", "likes", "knows"] + [f"deleted text {index}" for index in range(500)]
+
+    with _executed_statements(adapter) as statements:
+        in_use = await adapter.find_edge_texts_in_use(asked)
+
+    assert in_use == {"a knows b", "likes"}
+    assert not _narrowed_by_text(statements)
+    assert not any("deleted text" in statement for statement in statements)
+
+    # With no edge left there is nothing in use, whatever is asked.
+    await adapter.delete_graph()
+    assert await adapter.find_edge_texts_in_use(asked) == set()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("encoding", ["SQL_ASCII", "LATIN1"])
+async def test_edge_texts_in_use_on_a_database_that_is_not_utf8(adapter, encoding):
+    """In a single-byte encoding ``btrim`` works on bytes, and the whitespace
+    characters cannot be sent to every encoding, so the adapter does not narrow by
+    text there. A relationship name is a plain text column and may hold "é" in both
+    encodings; narrowed byte-wise, SQL_ASCII lost such an edge."""
+    database = f"cognee_graph_{encoding.lower()}_{uuid4().hex[:8]}"
+    url = adapter.engine.url.set(database=database).render_as_string(hide_password=False)
+    async with adapter.engine.connect() as connection:
+        autocommit = await connection.execution_options(isolation_level="AUTOCOMMIT")
+        await autocommit.execute(
+            text(
+                f"CREATE DATABASE {database} ENCODING '{encoding}' TEMPLATE template0 "
+                "LC_COLLATE 'C' LC_CTYPE 'C'"
+            )
+        )
+    other = PostgresDemoAdapter(connection_string=url)
+    try:
+        await other.initialize()
+        await other.add_node(_FakeDataPoint(id="hub", name="hub", type="Entity"))
+        for index in range(12):
+            node_id = f"n{index}"
+            await other.add_node(_FakeDataPoint(id=node_id, name=node_id, type="Entity"))
+            await other.add_edge("hub", node_id, f"rel_{index}", {"edge_text": f"text {index}"})
+        await other.add_node(_FakeDataPoint(id="accented", name="accented", type="Entity"))
+        await other.add_edge("hub", "accented", "créé")
+        await other.add_edge("accented", "hub", "voilà", {"edge_text": "  "})
+
+        asked = ["créé", "voilà", "text 3", "rel_3", "nobody has this"]
+        with _executed_statements(other) as statements:
+            in_use = await other.find_edge_texts_in_use(asked)
+
+        assert in_use == {"créé", "voilà", "text 3"}
+        assert in_use == await GraphDBInterface.find_edge_texts_in_use(other, asked)
+        assert not _narrowed_by_text(statements)
+    finally:
+        await other.close()
+        async with adapter.engine.connect() as connection:
+            autocommit = await connection.execution_options(isolation_level="AUTOCOMMIT")
+            await autocommit.execute(text(f"DROP DATABASE IF EXISTS {database} WITH (FORCE)"))

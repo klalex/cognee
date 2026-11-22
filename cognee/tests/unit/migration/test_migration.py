@@ -8,6 +8,7 @@ import json
 import xml.etree.ElementTree as ET
 from datetime import datetime, timezone
 
+from cognee.modules.migration import loader
 from cognee.modules.migration.cogx import (
     COGX_VERSION,
     COGXArchiveWriter,
@@ -24,7 +25,6 @@ from cognee.modules.migration.cogx import (
     read_manifest,
 )
 from cognee.modules.migration.formats import write_cypher, write_graphml, write_json
-from cognee.modules.migration import loader
 from cognee.modules.migration.loader import record_data_id, translate_records
 from cognee.modules.migration.sources import (
     COGXArchiveSource,
@@ -32,6 +32,8 @@ from cognee.modules.migration.sources import (
     LettaSource,
     Mem0Source,
 )
+from cognee.modules.operations import remote_caller_scope
+from cognee.tasks.ingestion.screen_server_paths import screen_server_paths
 
 
 def collect(source):
@@ -69,7 +71,7 @@ class TestParseTimestamp:
             2024, 3, 1, 12, 0, tzinfo=timezone.utc
         )
         assert parse_timestamp("2024-03-01") == datetime(2024, 3, 1, tzinfo=timezone.utc)
-        assert parse_timestamp(datetime(2024, 3, 1, 12, 0)) == datetime(
+        assert parse_timestamp(datetime(2024, 3, 1, 12, 0)) == datetime(  # noqa: DTZ001 - naive input is the case under test
             2024, 3, 1, 12, 0, tzinfo=timezone.utc
         )
 
@@ -532,7 +534,7 @@ class TestTranslateRecords:
         assert {"Alice", "Berlin", "Person"} <= node_names
 
         assert len(batch["edges"]) == 1
-        source_id, target_id, relationship, properties = batch["edges"][0]
+        source_id, _target_id, relationship, properties = batch["edges"][0]
         assert relationship == "lives_in"
         assert properties["edge_text"] == "Alice lives in Berlin"
         assert properties["valid_at"].startswith("2024-02-01")
@@ -663,6 +665,32 @@ class TestFormatEmitters:
         assert len(graph.findall(f"{namespace}node")) == 2
         assert len(graph.findall(f"{namespace}edge")) == 1
 
+    def test_graphml_data_keys_are_all_declared(self, tmp_path):
+        # Every <data key="..."> must reference a declared <key id="...">. The edge
+        # relationship_name datum was emitted without a matching <key> declaration,
+        # which strict GraphML readers reject even though the XML is well-formed.
+        destination = tmp_path / "graph.graphml"
+        write_graphml(self.NODES, self.EDGES, destination)
+        root = ET.parse(destination).getroot()
+        namespace = "{http://graphml.graphdrawing.org/xmlns}"
+        declared = {key.get("id") for key in root.findall(f"{namespace}key")}
+        used = {data.get("key") for data in root.iter(f"{namespace}data")}
+        assert used <= declared, f"undeclared data keys: {used - declared}"
+        assert "e_relationship_name" in declared
+
+    def test_graphml_round_trips_through_networkx(self, tmp_path):
+        import networkx as nx
+
+        destination = tmp_path / "graph.graphml"
+        write_graphml(self.NODES, self.EDGES, destination)
+        graph = nx.read_graphml(destination)
+        assert graph.number_of_nodes() == 2
+        assert graph.number_of_edges() == 1
+        source, target, data = next(iter(graph.edges(data=True)))
+        assert (source, target) == ("id-1", "id-2")
+        assert data["relationship_name"] == "lives_in"
+        assert data["edge_text"] == "Alice lives in Berlin"
+
     def test_cypher(self, tmp_path):
         destination = tmp_path / "graph.cypher"
         write_cypher(self.NODES, self.EDGES, destination)
@@ -673,6 +701,27 @@ class TestFormatEmitters:
         assert "MERGE (a)-[r:`lives_in`]->(b)" in script
         # Non-scalar property serialized as JSON string, not raw repr.
         assert '"[\\"city\\", \\"capital\\"]"' in script
+
+
+class TestImportedContentIsLiteralText:
+    """Provider content is text: never resolved as a server path or URL."""
+
+    RECORDS = [
+        COGXDocument(external_system="t", external_id="d1", title="t", content="w/o"),
+        COGXMemory(external_system="t", external_id="m1", content="github.com/org/repo"),
+        COGXMemoryBlock(external_system="t", external_id="b1", label="l", value="/etc/passwd"),
+    ]
+
+    def test_every_content_record_is_literal_text(self):
+        for record in self.RECORDS:
+            assert loader.data_item_from_record(record).literal_text is True
+
+    def test_a_remote_import_passes_the_entry_screen(self):
+        # Without the flag "github.com/org/repo" is path-only and would be refused.
+        item = loader.data_item_from_record(self.RECORDS[1])
+
+        with remote_caller_scope():
+            assert screen_server_paths([item]) == [item]
 
 
 class TestImportModeValidation:

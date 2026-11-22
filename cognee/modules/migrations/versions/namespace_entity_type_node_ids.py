@@ -118,6 +118,13 @@ Caveats:
 - The legacy ``graph_relationship_ledger`` has no ``dataset_id`` column, so its
   rows are updated globally; this is benign because old ids are deterministic
   and every dataset is migrated in the same run.
+
+Note: this migration works through the graph adapter's own methods, so it runs
+with the adapter of the cognee release doing the upgrade. A Postgres graph that
+still keeps source refs in the ``source_ref_keys`` columns is refused by the
+current adapter (see ``postgres_graph_source_ref_tables``). A database that has
+not passed this migration yet must be upgraded to cognee 1.6.8 first, and to the
+current release after that.
 """
 
 import json
@@ -135,10 +142,20 @@ from cognee.infrastructure.engine import DataPoint
 from cognee.modules.migrations.migration import MigrationContext
 from cognee.modules.migrations.versions._vector_rekey import (
     RekeyedPoint as _RekeyedPoint,
+)
+from cognee.modules.migrations.versions._vector_rekey import (
     index_data_points_batched as _index_data_points_batched,
+)
+from cognee.modules.migrations.versions._vector_rekey import (
     lancedb_where as _lancedb_where,
+)
+from cognee.modules.migrations.versions._vector_rekey import (
     rekey_lancedb as _rekey_lancedb,
+)
+from cognee.modules.migrations.versions._vector_rekey import (
     rekey_native as _rekey_native,
+)
+from cognee.modules.migrations.versions._vector_rekey import (
     rekey_pgvector as _rekey_pgvector,
 )
 
@@ -801,6 +818,7 @@ async def _edges_needing_reassert(graph_engine, at_risk: list) -> list:
             "%d at-risk edge(s)",
             error,
             len(at_risk),
+            exc_info=True,
         )
         return at_risk
 

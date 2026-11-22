@@ -1,0 +1,92 @@
+# Product journey tests
+
+High-level contract tests that check what a user experiences, not what a
+module does. Each file is one journey with content-level assertions: a fact
+must come back, a count must match, a status must be honest. "Returned
+something" is never a pass here.
+
+| File | Journey | What breaks it |
+|---|---|---|
+| `test_quickstart.py` | Build the wheel, install into an empty venv, run README remember/recall and the CLI entry point | Packaging, entry points, first-run DB creation, import-time side effects |
+| `test_memory_correctness.py` | Remember 20 fictional documents, ask 30 gold questions through recall and every search type | Retrieval or graph regressions that still return non-empty results |
+| `test_session_journey.py` | Remember in a session, recall from cache, bridge into the graph with improve, delete the session | Session cache, keyword session search, improve bridging, cache deletion |
+| `test_data_lifecycle.py` | remember, update, forget one item, forget dataset, forget everything, remember again; snapshot all three stores after each step | Stale vectors or graph nodes after update/delete, deletion leaving zombies |
+| `test_idempotency_and_recovery.py` | Same content twice, explicit cognify re-run, injected LLM outage, retry | Duplicate ingestion, half-written graphs, dishonest pipeline status |
+| `test_provenance_ledger_journey.py` | With `PROVENANCE_TRACKING` on: remember, update, forget one item, drop its memory only, re-cognify, delete the dataset; a ledger that cannot be written | Ledger rows for nodes or edges, an update the ledger does not version, a delete that writes no tombstone, a tombstone written before the document is gone or for a memory-only forget, a ledger failure that is swallowed |
+| `test_stored_files_journey.py` | Text and an upload through remember, two updates (chunk-level and full rebuild), an unchanged and a failed update, a duplicate add while another add of the same upload is in flight, storage that cannot delete, forget; the files under the data root after each step | A previous version's file left on disk after an update, staged content of an update that did not publish, any file left after `forget()`, a shared file removed while another document uses it |
+| `test_default_chunker_update.py` | A registered chunker named in `DEFAULT_CHUNKER` cuts a document; one section is edited; the default chunker changes under a stored document, also one stored before chunks carried a chunker id; a registered chunker leaves its id off its chunks; `DEFAULT_CHUNKER` names a chunker that was never registered | An update that rebuilds a document its own chunker cut, a rebuild that cuts with another chunker, a document rebuilt on every update after the default changed, a document patched by a chunker that did not cut it, old unstamped documents that stop updating chunk-level with TextChunker, a rebuild that fails after dropping the document's memory, a `remember()` that adds the document before refusing the chunker |
+| `test_http_api_journey.py` | Register, login, add, cognify (blocking + background polling), search, remember/recall, isolation between users, delete; route-table snapshot | Wire-shape drift, auth holes, 500s on bad input, polling contract |
+
+## Modes
+
+`COGNEE_JOURNEY_MODE=mock` (default) swaps the two AI calls for deterministic
+stand-ins from `mock_ai.py`:
+
+- The LLM replays the pre-authored knowledge graph and summary of the corpus
+  document named on a chunk's `Title:` line (a mere mention of another
+  document's title must not replay that document — the corpus cross-references
+  itself on purpose), extracts capitalised phrases for anything else, and
+  answers by echoing the prompt with the question cut out. A fact can only pass
+  if retrieval surfaced it, whichever completion template framed the context.
+- Embeddings are hashed bag-of-words vectors, so vector search ranks by shared
+  vocabulary. Deterministic across processes and machines.
+
+No network, no secrets. This tier runs on every PR, including forks. Because
+it is deterministic, the correctness journey holds every path to **30/30** in
+this mode; a lost question is a regression and the scorecard names it.
+
+`COGNEE_JOURNEY_MODE=llm` uses the real providers from the environment. The
+correctness journey switches to threshold assertions and additionally enforces
+`forbidden` tokens: a concise answer must not cite facts from unrelated
+documents.
+
+## How results are scored
+
+Only retrieved *content* is scored — chunk texts, summaries, completions,
+session answers — never the result envelope (ids, timestamps, dataset fields),
+and every gold token is matched as a whole token. `41` therefore cannot pass on
+the hex of a UUID or the digits of a `created_at`, and a fact cannot pass
+because the question mentioned it. Helpers: `_support.content_text` and
+`_support.contains_token`.
+
+## Running
+
+```bash
+# everything except the slow quickstart
+pytest cognee/tests/journeys -m "journey and not quickstart"
+
+# quickstart (builds a wheel, needs uv)
+COGNEE_JOURNEY_QUICKSTART=1 pytest cognee/tests/journeys -m quickstart
+
+# real LLM
+COGNEE_JOURNEY_MODE=llm pytest cognee/tests/journeys -m "journey and not quickstart"
+
+# accept an intentional route-table change (the only way the snapshot is written)
+COGNEE_UPDATE_API_SNAPSHOT=1 pytest cognee/tests/journeys/test_http_api_journey.py
+```
+
+The route snapshot is compared against the routes `dev` actually serves, so a
+branch that is behind `dev` fails it after another PR adds a route: merge `dev`,
+regenerate, commit the snapshot diff.
+
+## Golden corpus
+
+`golden_corpus/documents.json` describes the fictional town of Kestrel Hollow.
+Every fact is invented so a real model cannot answer from prior knowledge.
+Each document carries the knowledge graph and summary the mock LLM replays for
+it. `golden_corpus/questions.json` holds 30 questions with `expected_any`
+tokens (any one satisfies) and `forbidden` tokens from other documents.
+
+Add a document by appending to both files; keep texts to a single chunk, start
+them with a `Title:` line that matches the document's `title` exactly (that is
+how the mock finds the graph to replay), and give each new entity a
+distinctive name so hashed embeddings separate it. Pick `expected_any` tokens
+that do not appear in the question and, where possible, in no other document.
+
+## Why questions run in their own sessions
+
+Without a `session_id`, every turn shares one per-dataset default session and
+the conversational lane merges the previous turn's retrievals into the current
+context. Thirty unrelated questions asked back to back would contaminate each
+other, so the correctness journey isolates each question. The session journey
+covers the conversational behaviour on purpose.

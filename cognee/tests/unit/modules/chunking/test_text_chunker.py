@@ -1,11 +1,50 @@
 """Unit tests for TextChunker and TextChunkerWithOverlap behavioral equivalence."""
 
-import pytest
+import asyncio
+import importlib
+import threading
+from types import SimpleNamespace
+from unittest.mock import patch
 from uuid import uuid4
 
-from cognee.modules.chunking.TextChunker import TextChunker
+import pytest
+
+from cognee.context_global_variables import embedding_config
+from cognee.infrastructure.llm.tokenizer.TikToken.adapter import TikTokenTokenizer
 from cognee.modules.chunking.text_chunker_with_overlap import TextChunkerWithOverlap
+from cognee.modules.chunking.TextChunker import TextChunker
 from cognee.modules.data.processing.document_types import Document
+
+# importlib rather than `import ... as`: tasks/chunks/__init__.py re-exports
+# the functions under the same names as their modules, so the dotted import
+# resolves to the function and patch.object has nothing to patch.
+_chunk_by_row = importlib.import_module("cognee.tasks.chunks.chunk_by_row")
+_chunk_by_sentence = importlib.import_module("cognee.tasks.chunks.chunk_by_sentence")
+# The chunker modules themselves, to patch the chunk_by_paragraph each one calls.
+_text_chunker = importlib.import_module("cognee.modules.chunking.TextChunker")
+_overlap_chunker = importlib.import_module("cognee.modules.chunking.text_chunker_with_overlap")
+
+
+@pytest.fixture(autouse=True)
+def _pinned_tokenizer():
+    """Count tokens with the default engine's tiktoken, whatever ran before.
+
+    The expected chunk counts below assume tiktoken on text-embedding-3-large
+    (a word plus its trailing space is 2 tokens). chunk_by_sentence reads the
+    engine through the context-scoped embedding config, and an earlier test in
+    the same process can leave that pointing at a provider with no tokenizer,
+    where chunk_by_row falls back to one token per word and every count here
+    halves. That only showed up once the suite was sharded and this file
+    stopped running early. Pin the engine so the file is order-independent.
+    """
+    engine = SimpleNamespace(
+        tokenizer=TikTokenTokenizer(model="text-embedding-3-large", max_completion_tokens=8191)
+    )
+    with (
+        patch.object(_chunk_by_sentence, "get_embedding_engine", return_value=engine),
+        patch.object(_chunk_by_row, "get_embedding_engine", return_value=engine),
+    ):
+        yield
 
 
 @pytest.fixture(params=["TextChunker", "TextChunkerWithOverlap"])
@@ -246,3 +285,241 @@ async def test_chunk_indices_and_ids_are_deterministic(chunker_class, make_text_
     assert chunks1[0].id == chunks2[0].id, "First chunk ID should be deterministic"
     assert chunks1[1].id == chunks2[1].id, "Second chunk ID should be deterministic"
     assert chunks1[0].id != chunks1[1].id, "Chunk IDs should be unique within a run"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "document_metadata, expected",
+    [
+        ('{"created_at": "2024-01-15"}', '{"created_at": "2024-01-15"}'),
+        # ingest writes indented JSON; chunks carry the compact canonical form
+        (
+            '{\n    "created_at": "2024-01-15",\n    "node_set": ["a"]\n}',
+            '{"created_at": "2024-01-15", "node_set": ["a"]}',
+        ),
+        (None, None),
+        ("", None),
+        ("{}", None),
+        ("not json", None),
+        ('["a", "b"]', None),
+    ],
+)
+async def test_chunks_carry_the_document_external_metadata(
+    chunker_class, make_text_generator, document_metadata, expected
+):
+    """Every chunk copies the document's external_metadata as canonical JSON text.
+
+    Anything that is not a non-empty JSON object becomes None and never fails
+    chunking. The field stays out of index_fields, so it is never embedded.
+    """
+    document = Document(
+        id=uuid4(),
+        name="test_document",
+        raw_data_location="/test/path",
+        external_metadata=document_metadata,
+        mime_type="text/plain",
+    )
+    chunker = chunker_class(document, make_text_generator("Some text."), max_chunk_size=512)
+    chunks = await collect_chunks(chunker)
+
+    assert len(chunks) >= 1
+    for chunk in chunks:
+        assert chunk.external_metadata == expected
+        assert chunk.metadata["index_fields"] == ["text"]
+
+
+@pytest.mark.asyncio
+async def test_external_metadata_does_not_change_chunk_ids(chunker_class, make_text_generator):
+    """Chunk identity is content-derived; the metadata a document carries is not part of it."""
+    doc_id = uuid4()
+    text = "Same text in both runs."
+
+    def document(metadata):
+        return Document(
+            id=doc_id,
+            name="test_document",
+            raw_data_location="/test/path",
+            external_metadata=metadata,
+            mime_type="text/plain",
+        )
+
+    plain = await collect_chunks(
+        chunker_class(document(None), make_text_generator(text), max_chunk_size=512)
+    )
+    tagged = await collect_chunks(
+        chunker_class(
+            document('{"created_at": "2024-01-15"}'), make_text_generator(text), max_chunk_size=512
+        )
+    )
+
+    assert [chunk.id for chunk in plain] == [chunk.id for chunk in tagged]
+    assert all(chunk.external_metadata is None for chunk in plain)
+    assert all(chunk.external_metadata == '{"created_at": "2024-01-15"}' for chunk in tagged)
+
+
+@pytest.mark.asyncio
+async def test_chunking_runs_off_the_event_loop(chunker_class, make_text_generator):
+    """Cutting chunks tokenizes every word, so it must not hold the event loop.
+
+    The fake chunk_by_paragraph blocks until the loop has run again. Consumed
+    on the loop thread it would wait for something that cannot happen and time
+    out; consumed on a worker thread the loop keeps turning and releases it.
+    A large file arrives as several text blocks (TextDocument reads 1 MB at a
+    time), so two blocks go in, and each one must be cut off the loop.
+    """
+    loop_ran = threading.Event()
+    chunking_threads = []
+
+    def blocking_chunk_by_paragraph(text, max_chunk_size, batch_paragraphs=True):
+        chunking_threads.append(threading.current_thread())
+        assert loop_ran.wait(timeout=5), "chunk_by_paragraph held the event loop"
+        # Each block fills a chunk, so the chunker yields one chunk per block.
+        yield {
+            "text": text,
+            "chunk_size": max_chunk_size,
+            "cut_type": "paragraph_end",
+            "chunk_id": uuid4(),
+        }
+
+    document = Document(
+        id=uuid4(),
+        name="test_document",
+        raw_data_location="/test/path",
+        external_metadata=None,
+        mime_type="text/plain",
+    )
+    chunker = chunker_class(
+        document, make_text_generator("Some text.", "More text."), max_chunk_size=512
+    )
+    with (
+        patch.object(_text_chunker, "chunk_by_paragraph", blocking_chunk_by_paragraph),
+        patch.object(_overlap_chunker, "chunk_by_paragraph", blocking_chunk_by_paragraph),
+    ):
+        reading = asyncio.create_task(collect_chunks(chunker))
+        await asyncio.sleep(0)  # the chunker starts and hands the cutting to a worker
+        loop_ran.set()
+        chunks = await reading
+
+    assert [chunk.text for chunk in chunks] == ["Some text.", "More text."]
+    assert len(chunking_threads) == 2
+    assert all(thread is not threading.current_thread() for thread in chunking_threads)
+
+
+@pytest.mark.asyncio
+async def test_chunking_sees_the_callers_embedding_config(chunker_class, make_text_generator):
+    """Token counts come from the context-scoped embedding config, so the worker must see it.
+
+    A worker that ran outside the caller's context would read the process-wide config
+    instead and cut chunks to another tokenizer's counts, with no error.
+    """
+    seen_configs = []
+
+    def recording_chunk_by_paragraph(text, max_chunk_size, batch_paragraphs=True):
+        seen_configs.append(embedding_config.get())
+        yield {"text": text, "chunk_size": 1, "cut_type": "paragraph_end", "chunk_id": uuid4()}
+
+    document = Document(
+        id=uuid4(),
+        name="test_document",
+        raw_data_location="/test/path",
+        external_metadata=None,
+        mime_type="text/plain",
+    )
+    chunker = chunker_class(document, make_text_generator("Some text."), max_chunk_size=512)
+    callers_config = object()
+    token = embedding_config.set(callers_config)
+    try:
+        with (
+            patch.object(_text_chunker, "chunk_by_paragraph", recording_chunk_by_paragraph),
+            patch.object(_overlap_chunker, "chunk_by_paragraph", recording_chunk_by_paragraph),
+        ):
+            await collect_chunks(chunker)
+    finally:
+        embedding_config.reset(token)
+
+    assert seen_configs == [callers_config]
+
+
+@pytest.mark.asyncio
+async def test_chunking_errors_still_fail_read(chunker_class, make_text_generator):
+    """An error raised while cutting on the worker thread surfaces from read()."""
+
+    def failing_chunk_by_paragraph(text, max_chunk_size, batch_paragraphs=True):
+        raise ValueError("word longer than the chunk size")
+        yield  # a generator, like the real one
+
+    document = Document(
+        id=uuid4(),
+        name="test_document",
+        raw_data_location="/test/path",
+        external_metadata=None,
+        mime_type="text/plain",
+    )
+    chunker = chunker_class(document, make_text_generator("Some text."), max_chunk_size=512)
+    with (
+        patch.object(_text_chunker, "chunk_by_paragraph", failing_chunk_by_paragraph),
+        patch.object(_overlap_chunker, "chunk_by_paragraph", failing_chunk_by_paragraph),
+        pytest.raises(ValueError, match="word longer than the chunk size"),
+    ):
+        await collect_chunks(chunker)
+
+
+def _plain_document():
+    return Document(
+        id=uuid4(),
+        name="test_document",
+        raw_data_location="/test/path",
+        external_metadata=None,
+        mime_type="text/plain",
+    )
+
+
+@pytest.mark.asyncio
+async def test_overlap_chunker_keeps_records_a_custom_generator_reuses(make_text_generator):
+    """A custom get_chunk_data generator may update one dict between yields.
+
+    The records are collected on the worker before any chunk is emitted, so each one
+    must be copied as it is yielded, or every chunk ends up with the last yield's text.
+    """
+
+    def reusing_records(_text):
+        row = {"chunk_size": 11, "cut_type": "word"}
+        for text in ("first", "second", "third"):
+            row.update(text=text, chunk_id=uuid4())
+            yield row
+
+    chunker = TextChunkerWithOverlap(
+        _plain_document(),
+        make_text_generator("ignored"),
+        max_chunk_size=10,
+        get_chunk_data=reusing_records,
+    )
+
+    chunks = await collect_chunks(chunker)
+
+    assert [chunk.text for chunk in chunks] == ["first", "second", "third"]
+
+
+@pytest.mark.asyncio
+async def test_overlap_chunker_calls_an_eager_get_chunk_data_off_the_event_loop(
+    make_text_generator,
+):
+    """A get_chunk_data that returns a list does its work when called, so the call
+    itself must happen on the worker, not only the iteration of its result."""
+    calling_threads = []
+
+    def eager_records(text):
+        calling_threads.append(threading.current_thread())
+        return [{"text": text, "chunk_size": 1, "cut_type": "word", "chunk_id": uuid4()}]
+
+    chunker = TextChunkerWithOverlap(
+        _plain_document(),
+        make_text_generator("hello"),
+        max_chunk_size=10,
+        get_chunk_data=eager_records,
+    )
+
+    chunks = await collect_chunks(chunker)
+
+    assert [chunk.text for chunk in chunks] == ["hello"]
+    assert calling_threads and calling_threads[0] is not threading.current_thread()

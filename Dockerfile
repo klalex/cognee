@@ -1,5 +1,22 @@
+# Official Ladybug extension binaries — this image is the origin content
+# behind extension.ladybugdb.com, so copying from it here means the JSON
+# extension ships in the image and is never downloaded at runtime (see
+# cognee_db_workers/ladybug_extensions/README.md). All published versions are
+# collected (~1.7 MB per version pair) so this stage never needs touching when
+# the ladybug constraint changes; at runtime the loader only reads the
+# directory matching the installed ladybug version.
+# Pinned by digest so a compromised :latest tag cannot inject binaries into
+# the shipped image — same digest as scripts/fetch_ladybug_json_extension.sh,
+# which documents how to refresh both together on a ladybug bump.
+FROM ghcr.io/ladybugdb/extension-repo@sha256:2ab4c9473d4152ccd40effcc185cab699ab4c2716065854a9823ce3d61afc582 AS ladybug-extensions
+RUN mkdir -p /bundle && cd /usr/share/nginx/html && \
+    for f in v*/linux_*/json/libjson.lbug_extension; do \
+        d="/bundle/${f%/json/libjson.lbug_extension}"; \
+        mkdir -p "$d" && cp "$f" "$d/libjson.lbug_extension"; \
+    done
+
 # Use a Python image with uv pre-installed
-FROM ghcr.io/astral-sh/uv:python3.12-bookworm-slim AS uv
+FROM ghcr.io/astral-sh/uv:python3.12-bookworm-slim@sha256:e5b65587bce7de595f299855d7385fe7fca39b8a74baa261ba1b7147afa78e58 AS uv
 
 # Install the project into `/app`
 WORKDIR /app
@@ -46,12 +63,15 @@ RUN --mount=type=cache,target=/root/.cache/uv \
     for extra in ${COGNEE_EXTRAS}; do \
         set -- "$@" --extra "$extra"; \
     done; \
-    uv sync "$@" --extra docling --extra docling-full --extra docs --extra fastembed --extra debug --extra api --extra postgres --extra neo4j --extra falkor --extra tracing --extra monitoring --extra llama-index --extra aws --extra ollama --extra mistral --extra groq --extra anthropic --frozen --no-install-project --no-dev --no-editable
+    uv sync "$@" --extra docling --extra docling-full --extra docs --extra fastembed --extra debug --extra api --extra postgres --extra neo4j --extra falkor --extra tracing --extra monitoring --extra llama-index --extra aws --extra dlt --extra ollama --extra mistral --extra groq --extra anthropic --extra instructor --frozen --no-install-project --no-dev --no-editable
 
 # Then, add the rest of the project source code and install it
 # Installing separately from its dependencies allows optimal layer caching
 COPY ./cognee /app/cognee
 COPY ./cognee_db_workers /app/cognee_db_workers
+# Bundle the JSON extension for both image arches; the loader picks the file
+# matching the installed ladybug version and runtime platform.
+COPY --from=ladybug-extensions /bundle/ /app/cognee_db_workers/ladybug_extensions/
 # Compatibility shim that re-exports ladybug under the legacy `kuzu`
 # module name. Listed in [tool.hatch.build.targets.wheel] packages, and
 # imported at module load by alembic/versions/b9274c27a25a_kuzu_11_migration.py.
@@ -63,15 +83,29 @@ RUN --mount=type=cache,target=/root/.cache/uv \
     for extra in ${COGNEE_EXTRAS}; do \
         set -- "$@" --extra "$extra"; \
     done; \
-    uv sync "$@" --extra docling --extra docling-full --extra docs --extra fastembed --extra debug --extra api --extra postgres --extra neo4j --extra falkor --extra tracing --extra monitoring --extra llama-index --extra aws --extra ollama --extra mistral --extra groq --extra anthropic --frozen --no-dev --no-editable
+    uv sync "$@" --extra docling --extra docling-full --extra docs --extra fastembed --extra debug --extra api --extra postgres --extra neo4j --extra falkor --extra tracing --extra monitoring --extra llama-index --extra aws --extra dlt --extra ollama --extra mistral --extra groq --extra anthropic --extra instructor --frozen --no-dev --no-editable
 
-FROM python:3.12-slim-bookworm
+# The GLiNER runtime (keyless graph extraction): CPU-only torch from the PyTorch index
+# plus the gliner extra, baked in so a container never installs it at runtime. Runs
+# after the exact sync above, which would remove anything not in the lockfile.
+RUN --mount=type=cache,target=/root/.cache/uv \
+    /app/.venv/bin/python -m cognee.tasks.graph.gliner_demo.install
 
+FROM python:3.12-slim-bookworm@sha256:782412e85d0f0984994c290652577d4018aff08145c85b262bb63dc0c7522254
+
+# git: the code-graph route shallow-clones GitHub/GitLab repository URLs at
+# runtime (cognee/tasks/code_graph/resolve_repo.py); without it every remote
+# repo passed to add()/remember() fails with CodeRepositoryError.
+# ca-certificates: the base is pinned by digest, so its CA bundle is frozen at
+# that image; installing it here pulls bookworm-security's current one (the
+# eMudhra revocation, ENG-28, shipped as 20250419~deb12u2).
 RUN apt-get update && apt-get install -y \
     libpq5 \
     libgl1 \
     libglib2.0-0 \
     curl \
+    git \
+    ca-certificates \
     && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app

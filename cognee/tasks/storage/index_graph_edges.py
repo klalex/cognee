@@ -1,11 +1,11 @@
 from collections import Counter
-from typing import Optional, Dict, Any, List, Tuple, Union
+from typing import Any
 
-from cognee.shared.logging_utils import get_logger
 from cognee.infrastructure.databases.graph import get_graph_engine
-from cognee.modules.graph.utils.prepare_edges_for_storage import get_edge_retrieval_text
-from cognee.modules.graph.models.EdgeType import EdgeType
 from cognee.infrastructure.databases.graph.graph_db_interface import EdgeData
+from cognee.modules.graph.models.EdgeType import EdgeType
+from cognee.modules.graph.utils.prepare_edges_for_storage import get_edge_retrieval_text
+from cognee.shared.logging_utils import get_logger
 from cognee.tasks.storage.index_data_points import index_data_points
 
 logger = get_logger()
@@ -53,8 +53,9 @@ def create_edge_type_datapoints(edges_data) -> list[EdgeType]:
 
 
 async def index_graph_edges(
-    edges_data: Union[List[EdgeData], List[Tuple[str, str, str, Optional[Dict[str, Any]]]]] = None,
+    edges_data: list[EdgeData] | list[tuple[str, str, str, dict[str, Any] | None]] | None = None,
     vector_engine=None,
+    budget=None,
 ):
     """
     Indexes graph edges by creating and managing vector indexes for relationship types.
@@ -67,6 +68,9 @@ async def index_graph_edges(
     1. Initialize the graph engine if needed and retrieve edge data.
     2. Transform edge data into EdgeType datapoints.
     3. Index the EdgeType datapoints using the standard indexing function.
+
+    ``budget`` is handed to ``index_data_points`` so a caller indexing nodes at the
+    same time can keep both under one bound on embedding requests and admitted batches.
 
     Raises:
         RuntimeError: If initialization of the graph engine fails.
@@ -84,9 +88,7 @@ async def index_graph_edges(
 
         edge_type_datapoints = create_edge_type_datapoints(edges_data)
 
-        await index_data_points(edge_type_datapoints, vector_engine=vector_engine)
+        await index_data_points(edge_type_datapoints, vector_engine=vector_engine, budget=budget)
     except Exception as e:
         logger.error("Failed to index graph edges: %s", e)
         raise RuntimeError("Graph edge indexing error") from e
-
-    return None

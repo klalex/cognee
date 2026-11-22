@@ -1,22 +1,34 @@
 import logging
-from uuid import uuid5, NAMESPACE_OID
+from uuid import NAMESPACE_OID, uuid5
+
 from sqlalchemy import text
+
+from cognee.infrastructure.databases.relational.config import get_migration_config
 from cognee.infrastructure.databases.relational.get_migration_relational_engine import (
     get_migration_relational_engine,
 )
-from cognee.infrastructure.databases.relational.config import get_migration_config
-
+from cognee.modules.engine.models import ColumnValue, TableRow, TableType
+from cognee.modules.ontology.base_ontology_resolver import BaseOntologyResolver
+from cognee.modules.ontology.get_default_ontology_resolver import (
+    get_configured_authoritative_sources,
+    get_configured_ontology_resolver,
+)
+from cognee.modules.ontology.schema_alignment import align_tables_with_ontology
+from cognee.tasks.schema.ingest_database_schema import ingest_database_schema
+from cognee.tasks.schema.models import SchemaTable
 from cognee.tasks.storage.index_data_points import index_data_points
 from cognee.tasks.storage.index_graph_edges import index_graph_edges
-from cognee.tasks.schema.ingest_database_schema import ingest_database_schema
-
-from cognee.modules.engine.models import TableRow, TableType, ColumnValue
 
 logger = logging.getLogger(__name__)
 
 
 async def migrate_relational_database(
-    graph_db, schema, migrate_column_data=True, schema_only=False
+    graph_db,
+    schema,
+    migrate_column_data=True,
+    schema_only=False,
+    ontology_resolver: BaseOntologyResolver | None = None,
+    authoritative_sources: dict[str, str | None] | None = None,
 ):
     """
     Migrates data from a relational database into a graph database.
@@ -28,6 +40,13 @@ async def migrate_relational_database(
     Then, for every foreign key defined in the schema:
       - Establishes relationships between TableRow nodes based on foreign key relationships
 
+    When an ontology is configured (``ontology_resolver``, else ``ONTOLOGY_FILE_PATH``),
+    each table node also gets a ``realizes`` edge to the ontology class its name
+    resolves to, plus that class's ``is_a`` chain — the link between the technical
+    schema and the business model. ``authoritative_sources`` (table name to owner,
+    else ``ONTOLOGY_AUTHORITATIVE_SOURCES``) says which tables are the system of
+    record; it is stamped on the ``realizes`` edge as ``authoritative`` / ``owner``.
+
     Both TableType and TableRow inherit from DataPoint to maintain consistency with Cognee data model.
     """
     # Create a mapping of node_id to node objects for referencing in edge creation
@@ -36,6 +55,23 @@ async def migrate_relational_database(
 
     else:
         node_mapping, edge_mapping = await complete_database_ingestion(schema, migrate_column_data)
+
+    if ontology_resolver is None:
+        ontology_resolver = get_configured_ontology_resolver()
+    if authoritative_sources is None:
+        authoritative_sources = get_configured_authoritative_sources()
+    entity_types, alignment_edges = align_tables_with_ontology(
+        {
+            node.id: node.name
+            for node in node_mapping.values()
+            if isinstance(node, (SchemaTable, TableType))
+        },
+        ontology_resolver,
+        authoritative_sources,
+    )
+    for entity_type in entity_types:
+        node_mapping.setdefault(str(entity_type.id), entity_type)
+    edge_mapping.extend(alignment_edges)
 
     def _remove_duplicate_edges(edge_mapping):
         seen = set()
@@ -97,11 +133,11 @@ async def schema_only_ingestion(schema):
                 table_node_id,
                 database_node_id,
                 "is_part_of",
-                dict(
-                    source_node_id=table_node_id,
-                    target_node_id=database_node_id,
-                    relationship_name="is_part_of",
-                ),
+                {
+                    "source_node_id": table_node_id,
+                    "target_node_id": database_node_id,
+                    "relationship_name": "is_part_of",
+                },
             )
         )
     table_name_to_id = {t.name: t.id for t in schema_tables}
@@ -118,11 +154,11 @@ async def schema_only_ingestion(schema):
                 source_table_id,
                 relationship_id,
                 "has_relationship",
-                dict(
-                    source_node_id=source_table_id,
-                    target_node_id=relationship_id,
-                    relationship_name=rel.relationship_type,
-                ),
+                {
+                    "source_node_id": source_table_id,
+                    "target_node_id": relationship_id,
+                    "relationship_name": rel.relationship_type,
+                },
             )
         )
         edge_mapping.append(
@@ -130,11 +166,11 @@ async def schema_only_ingestion(schema):
                 relationship_id,
                 target_table_id,
                 "has_relationship",
-                dict(
-                    source_node_id=relationship_id,
-                    target_node_id=target_table_id,
-                    relationship_name=rel.relationship_type,
-                ),
+                {
+                    "source_node_id": relationship_id,
+                    "target_node_id": target_table_id,
+                    "relationship_name": rel.relationship_type,
+                },
             )
         )
         edge_mapping.append(
@@ -142,11 +178,11 @@ async def schema_only_ingestion(schema):
                 source_table_id,
                 target_table_id,
                 rel.relationship_type,
-                dict(
-                    source_node_id=source_table_id,
-                    target_node_id=target_table_id,
-                    relationship_name=rel.relationship_type,
-                ),
+                {
+                    "source_node_id": source_table_id,
+                    "target_node_id": target_table_id,
+                    "relationship_name": rel.relationship_type,
+                },
             )
         )
     return node_mapping, edge_mapping
@@ -201,7 +237,7 @@ async def complete_database_ingestion(schema, migrate_column_data):
                     name=node_id,
                     is_a=table_node,
                     properties=str(row_properties),
-                    description=f'Row in relational database table from the table with the name: "{table_name}" with the following row data {str(row_properties)} where the dictionary key value is the column name and the value is the column value. This row has the id of: {node_id}',
+                    description=f'Row in relational database table from the table with the name: "{table_name}" with the following row data {row_properties!s} where the dictionary key value is the column name and the value is the column value. This row has the id of: {node_id}',
                 )
 
                 # Store the node object in our mapping
@@ -213,11 +249,11 @@ async def complete_database_ingestion(schema, migrate_column_data):
                         row_node.id,
                         table_node.id,
                         "is_part_of",
-                        dict(
-                            relationship_name="is_part_of",
-                            source_node_id=row_node.id,
-                            target_node_id=table_node.id,
-                        ),
+                        {
+                            "relationship_name": "is_part_of",
+                            "source_node_id": row_node.id,
+                            "target_node_id": table_node.id,
+                        },
                     )
                 )
 
@@ -230,7 +266,7 @@ async def complete_database_ingestion(schema, migrate_column_data):
 
                     for key, value in row_properties.items():
                         # Skip mapping primary key information to itself and mapping of foreign key information (as it will be mapped bellow)
-                        if key is primary_key_col or key in foreign_keys:
+                        if key == primary_key_col or key in foreign_keys:
                             continue
 
                         # Create column value node
@@ -249,11 +285,11 @@ async def complete_database_ingestion(schema, migrate_column_data):
                                 row_node.id,
                                 column_node.id,
                                 key,
-                                dict(
-                                    relationship_name=key,
-                                    source_node_id=row_node.id,
-                                    target_node_id=column_node.id,
-                                ),
+                                {
+                                    "relationship_name": key,
+                                    "source_node_id": row_node.id,
+                                    "target_node_id": column_node.id,
+                                },
                             )
                         )
 
@@ -299,11 +335,11 @@ async def complete_database_ingestion(schema, migrate_column_data):
                             source_node.id,
                             target_node.id,
                             fk["column"],
-                            dict(
-                                source_node_id=source_node.id,
-                                target_node_id=target_node.id,
-                                relationship_name=fk["column"],
-                            ),
+                            {
+                                "source_node_id": source_node.id,
+                                "target_node_id": target_node.id,
+                                "relationship_name": fk["column"],
+                            },
                         )
                     )
         return node_mapping, edge_mapping

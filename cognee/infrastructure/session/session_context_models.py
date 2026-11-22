@@ -1,16 +1,29 @@
 from enum import Enum
-from typing import Annotated, List, Literal, Optional
+from typing import Annotated, Literal
 
 from pydantic import BaseModel, Field, field_validator, model_validator
 
 VALID_RATINGS = {"helpful", "harmful"}
 MAX_CONTEXT_CONTENT_CHARS = 280
-MIN_CANDIDATE_CONFIDENCE = 0.75
 
-# Gate shared by every downstream consumer of stored guidance (session
-# distillation, preference personalization): an entry is usable only when it
-# was never rated harmful and its confidence clears this threshold.
-MIN_GATE_CONFIDENCE = 0.75
+
+def clip_text(text: str, limit: int) -> str:
+    """``text`` on one line, cut to ``limit`` characters with a trailing ``…``."""
+    text = " ".join(str(text or "").split())
+    return text if len(text) <= limit else text[: limit - 1] + "…"
+
+
+# One threshold, declared once here with the models it gates: a candidate must
+# clear it to be stored, and a stored entry must clear it to be served,
+# distilled, or folded into preferences. The harmful-rating rule differs by
+# consumer: serving and preferences require never-rated-harmful
+# (``is_context_entry_usable``), while distillation uses net helpfulness
+# (``session_distillation.distill.is_entry_distillable`` — an entry rated
+# harmful once and helpful three times is still distillable). The two legacy
+# names are kept for their existing importers.
+GATE_CONFIDENCE = 0.75
+MIN_CANDIDATE_CONFIDENCE = GATE_CONFIDENCE
+MIN_GATE_CONFIDENCE = GATE_CONFIDENCE
 
 
 class ContextSection(str, Enum):
@@ -65,7 +78,7 @@ def normalize_content(text: str) -> str:
     return " ".join(text.strip().lower().split())
 
 
-def coerce_rating_or_none(value) -> Optional[int]:
+def coerce_rating_or_none(value) -> int | None:
     """Coerce a 1-5 answer rating to int; anything else degrades to None.
 
     Malformed values (bools, non-integral floats, non-numbers, out-of-range
@@ -126,7 +139,10 @@ class CandidateContextUpdate(BaseModel):
     )
     confidence: float = Field(
         default=0.0,
-        description="Confidence from 0 to 1. Only candidates with confidence >= 0.75 are stored.",
+        description=(
+            "Confidence from 0 to 1. Only candidates with confidence "
+            f">= {GATE_CONFIDENCE} are stored."
+        ),
     )
 
     @field_validator("section")
@@ -236,6 +252,10 @@ class AgentCandidateContextUpdate(CandidateContextUpdate):
     """A proposed new agent-profile session-context lesson (tool/workflow guidance)."""
 
     context_profile: Literal["agent"] = ContextProfile.AGENT.value
+    # No max_length: one long support string would fail the whole batch's validation.
+    # The applier clips both when it stores the entry.
+    reason: str = Field(default="", description="Why this project fact matters.")
+    evidence: str = Field(default="", description="Supporting trace observation.")
     section: str = Field(
         description=(
             "One of tool_rules, workflow_state, success_patterns, failure_lessons, or "
@@ -338,7 +358,7 @@ AgentCandidateContextUpdateVariant = Annotated[
 class AgentContextExtraction(BaseModel):
     """LLM output for the batch pass: agent-profile lessons drawn from trace evidence."""
 
-    lessons: List[AgentCandidateContextUpdateVariant] = Field(
+    lessons: list[AgentCandidateContextUpdateVariant] = Field(
         default_factory=list,
         description=(
             "Reusable agent/tool lessons drawn from the traces. Each item must be one of the "
@@ -365,6 +385,48 @@ class AgentContextExtraction(BaseModel):
         return normalized
 
 
+class CodingCandidateLesson(BaseModel):
+    """One lesson of a coding extraction with the turn it was learned in (SDK-1335)."""
+
+    turn: int = Field(
+        description=(
+            "The number of the turn the lesson was learned in, as the TRACES and FINAL "
+            "MESSAGE sections number them (1-based)."
+        ),
+    )
+    lesson: AgentCandidateContextUpdateVariant
+
+
+class CodingAgentContextExtraction(BaseModel):
+    """LLM output of the coding extraction: agent lessons, each tied to its turn.
+
+    A separate model so the default extraction's schema (``AgentContextExtraction``)
+    does not change with the mode.
+    """
+
+    lessons: list[CodingCandidateLesson] = Field(
+        default_factory=list,
+        description=(
+            "Reusable agent/tool lessons drawn from the traces, each with the number of "
+            "the turn it comes from."
+        ),
+    )
+
+    @field_validator("lessons", mode="before")
+    @classmethod
+    def normalize_lessons(cls, value):
+        if not isinstance(value, list):
+            return []
+        normalized = []
+        for item in value:
+            if isinstance(item, dict) and isinstance(item.get("lesson"), dict):
+                item = dict(item)
+                (lesson,) = AgentContextExtraction.normalize_lessons([item["lesson"]])
+                item["lesson"] = lesson
+            normalized.append(item)
+        return normalized
+
+
 class SessionContextEntry(BaseModel):
     """A stored active session-context lesson, tagged by profile (qa or agent)."""
 
@@ -375,13 +437,19 @@ class SessionContextEntry(BaseModel):
     normalized_content: str = ""
     confidence: float = 0.0
     created_at: str
-    source_feedback_ids: List[str] = Field(default_factory=list)
-    source_trace_ids: List[str] = Field(default_factory=list)
+    source_feedback_ids: list[str] = Field(default_factory=list)
+    source_trace_ids: list[str] = Field(default_factory=list)
+    # The Q&A rows (turns) a coding lesson was learned in; the distillation judges
+    # the lesson against those turns' requests and answers.
+    source_qa_ids: list[str] = Field(default_factory=list)
     helpful_count: int = 0
     harmful_count: int = 0
     priority: int = 0
-    last_served_at: Optional[str] = None
-    embedding: Optional[List[float]] = None
+    last_served_at: str | None = None
+    reason: str = ""
+    evidence: str = ""
+    expired_at: str | None = None
+    embedding: list[float] | None = None
     kind: Literal["context"] = "context"
 
     @field_validator("id")
@@ -452,9 +520,9 @@ class SessionContextEntry(BaseModel):
             raise ValueError("count must be >= 0")
         return v
 
-    @field_validator("source_feedback_ids", "source_trace_ids")
+    @field_validator("source_feedback_ids", "source_trace_ids", "source_qa_ids")
     @classmethod
-    def source_id_lists_only_strings(cls, v: List[str]) -> List[str]:
+    def source_id_lists_only_strings(cls, v: list[str]) -> list[str]:
         if not isinstance(v, list):
             raise ValueError("source id list must be a list")
         normalized = []
@@ -484,11 +552,13 @@ class SessionContextEntry(BaseModel):
 
 
 def is_context_entry_usable(entry: SessionContextEntry) -> bool:
-    """Shared downstream gate: never rated harmful and confidence clears the threshold.
+    """Serving/preferences gate: never rated harmful and confidence clears the threshold.
 
-    Both session distillation and preference personalization consume stored guidance
-    through this one check, so the two features can never drift apart on what counts
-    as a usable entry.
+    Session serving and preference personalization consume stored guidance through
+    this check. Distillation deliberately does NOT: it gates on net helpfulness
+    (``session_distillation.distill.is_entry_distillable``), so an entry rated
+    harmful once and helpful three times can still be distilled while it is
+    withheld from live serving.
     """
     return entry.harmful_count == 0 and entry.confidence >= MIN_GATE_CONFIDENCE
 
@@ -499,10 +569,10 @@ class SessionFeedbackEntry(BaseModel):
     id: str
     created_at: str
     raw_text: str
-    referenced_qa_ids: List[str] = Field(default_factory=list)
-    referenced_qa_rating: Optional[int] = None
-    influencing_context_ids: List[str] = Field(default_factory=list)
-    candidate_context_entries: List[dict] = Field(default_factory=list)
+    referenced_qa_ids: list[str] = Field(default_factory=list)
+    referenced_qa_rating: int | None = None
+    influencing_context_ids: list[str] = Field(default_factory=list)
+    candidate_context_entries: list[dict] = Field(default_factory=list)
     kind: Literal["feedback"] = "feedback"
 
     @field_validator("referenced_qa_rating", mode="before")
@@ -524,7 +594,7 @@ class SessionFeedbackEntry(BaseModel):
 
     @field_validator("referenced_qa_ids", "influencing_context_ids")
     @classmethod
-    def id_lists_only_strings(cls, v: List[str]) -> List[str]:
+    def id_lists_only_strings(cls, v: list[str]) -> list[str]:
         if not isinstance(v, list):
             raise ValueError("id list must be a list")
         normalized = []

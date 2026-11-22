@@ -1,13 +1,26 @@
 from pathlib import Path
+from typing import BinaryIO
 from urllib.parse import urlparse
-from typing import List, Union, BinaryIO
 
-from cognee.tasks.ingestion.exceptions import S3FileSystemNotFoundError
 from cognee.infrastructure.files.storage.s3_config import get_s3_config
 from cognee.infrastructure.files.utils.local_path_safety import resolve_local_path
+from cognee.tasks.ingestion.data_item import DataItem
+from cognee.tasks.ingestion.exceptions import S3FileSystemNotFoundError
+from cognee.tasks.ingestion.path_shape import is_path_only_string
+from cognee.tasks.ingestion.save_data_item_to_storage import (
+    local_file_paths_accepted,
+    require_server_path_access,
+)
 
 
 def _resolve_existing_local_path(item: str) -> Path | None:
+    if not local_file_paths_accepted():
+        # Gate closed: the disk is never asked, so no reply reveals whether a
+        # path exists. A string that is only a path is refused by its shape, as
+        # the entry screen refuses it, so an unscreened one fails loudly.
+        if is_path_only_string(item):
+            require_server_path_access()
+        return None
     try:
         return resolve_local_path(item, must_exist=True)
     except FileNotFoundError:
@@ -22,13 +35,20 @@ def _resolve_existing_local_path(item: str) -> Path | None:
 
 
 async def resolve_data_directories(
-    data: Union[BinaryIO, List[BinaryIO], str, List[str]],
+    data: BinaryIO | list[BinaryIO] | str | list[str],
     include_subdirectories: bool = True,
     user=None,
     dataset_id=None,
+    branch: str | None = None,
 ):
     """
     Resolves directories by replacing them with their contained files.
+
+    A GitHub/GitLab repository URL (``code_repo_clone_url``) is shallow-cloned
+    (``branch``, when given, instead of the remote's default) and then resolved
+    exactly like a local code project directory, below.
+    Other http(s) URLs pass through untouched and are fetched as web pages by
+    ``save_data_item_to_storage``.
 
     A local directory that IS a code project (see
     ``cognee.tasks.code_graph.code_repo.PROJECT_MARKERS``) is not flattened:
@@ -44,6 +64,7 @@ async def resolve_data_directories(
         include_subdirectories: Whether to include files in subdirectories recursively.
         user: Owner used to pin repo-manifest data ids (optional).
         dataset_id: Dataset used to pin repo-manifest data ids (optional).
+        branch: Branch to clone for each repository URL in ``data`` (optional).
 
     Returns:
         A list of resolved files, DataItems, and binary streams.
@@ -70,6 +91,9 @@ async def resolve_data_directories(
         if isinstance(item, str):  # Check if the item is a path
             # S3
             if urlparse(item).scheme == "s3":
+                # Listed with cognee's own AWS credentials: the same gate as a
+                # local path, before anything is listed.
+                require_server_path_access()
                 if fs is not None:
                     if include_subdirectories:
                         base_path = item if item.endswith("/") else item + "/"
@@ -92,6 +116,27 @@ async def resolve_data_directories(
                     raise S3FileSystemNotFoundError()
                 continue
 
+            # A GitHub/GitLab repository URL is a code project, not a web page:
+            # clone it and resolve it like the local project directory below --
+            # one code_repo manifest plus the repo's documents. Deferred import:
+            # code_repo reaches back into this package (dlt_utils).
+            from cognee.tasks.code_graph.resolve_repo import code_repo_clone_url
+
+            if code_repo_clone_url(item) is not None:
+                from cognee.tasks.code_graph.code_repo import resolve_code_repository_url
+
+                manifest_item, document_paths, _skipped = await resolve_code_repository_url(
+                    item, user=user, dataset_id=dataset_id, branch=branch
+                )
+                resolved_data.append(manifest_item)
+                resolved_data.extend(
+                    DataItem(data=str(path), cognee_path=True) for path in document_paths
+                )
+                continue
+
+            # Gated: with the gate closed nothing is looked up, so no directory is
+            # listed and no code project walked. A string that is not an existing
+            # path is text, not a path.
             local_path = _resolve_existing_local_path(item)
 
             if local_path and local_path.is_dir():  # If it's a directory
@@ -109,7 +154,9 @@ async def resolve_data_directories(
                             local_path, user=user, dataset_id=dataset_id
                         )
                         resolved_data.append(manifest_item)
-                        resolved_data.extend(str(path) for path in document_paths)
+                        resolved_data.extend(
+                            DataItem(data=str(path), cognee_path=True) for path in document_paths
+                        )
                         continue
 
                     # Recursively add all files in the directory and subdirectories

@@ -29,9 +29,11 @@ Configuration (env):
 import base64
 import json
 import os
-from typing import Any, Optional
+from typing import Any
 
+from cryptography.hazmat.primitives import hashes
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
+from cryptography.hazmat.primitives.kdf.hkdf import HKDF
 
 CURRENT_ENCRYPTION_VERSION = 1
 
@@ -86,6 +88,24 @@ def _key_for(key_id: str, ring: dict[str, bytes]) -> bytes:
     return key
 
 
+def oauth_state_signing_key() -> str:
+    """The key every integration's OAuth ``state`` is signed with, hex-encoded.
+
+    Derived with HKDF from the active credentials key, so only this server holds it: a
+    provider's webhook or signing secret is also known to the provider and to whoever
+    administers the app there, and a state signed with it can be forged for any user.
+    Rotating the active key invalidates the states in flight (ten minutes at most).
+    """
+    key = _key_for(_active_key_id(), _load_keyring())
+    return (
+        HKDF(
+            algorithm=hashes.SHA256(), length=32, salt=None, info=b"cognee:integrations:oauth-state"
+        )
+        .derive(key)
+        .hex()
+    )
+
+
 def encrypt_credentials(payload: dict[str, Any]) -> tuple[bytes, bytes, int, str]:
     """Serialize and encrypt a credentials payload under the active key.
 
@@ -101,7 +121,7 @@ def encrypt_credentials(payload: dict[str, Any]) -> tuple[bytes, bytes, int, str
 
 
 def decrypt_credentials(
-    ciphertext: bytes, nonce: bytes, encryption_version: int, key_id: Optional[str]
+    ciphertext: bytes, nonce: bytes, encryption_version: int, key_id: str | None
 ) -> dict[str, Any]:
     """Decrypt a stored payload, dispatching on its ``encryption_version`` and ``key_id``.
 

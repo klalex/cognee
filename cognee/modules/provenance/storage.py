@@ -17,15 +17,16 @@ graceful-degradation catch lives one level up and writes nothing on failure.
 """
 
 import asyncio
-from typing import AsyncIterator, Awaitable, Callable, Dict, List, Optional, Tuple
+from collections.abc import AsyncIterator, Awaitable, Callable
 from weakref import WeakKeyDictionary
 
-from sqlalchemy import delete, distinct, func, select, text
+from sqlalchemy import and_, delete, distinct, func, literal, not_, or_, select, text
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from cognee.infrastructure.databases.relational import get_async_session
 
+from .integrity import canonical_entity_id
 from .models import ProvenanceEntry, ProvenanceEntryRow
 
 # Constant app-level advisory lock id for the provenance chain (Postgres only).
@@ -52,7 +53,7 @@ async def _acquire_chain_write_lock(session: AsyncSession) -> None:
         await session.execute(text("SELECT pg_advisory_xact_lock(:key)"), {"key": _PG_ADVISORY_KEY})
 
 
-async def get_chain_head(session: AsyncSession) -> Optional[Tuple[int, Optional[str]]]:
+async def get_chain_head(session: AsyncSession) -> tuple[int, str | None] | None:
     """Return (sequence_id, checksum) of the newest chained entry, or None if empty."""
     row = (
         await session.execute(
@@ -65,10 +66,10 @@ async def get_chain_head(session: AsyncSession) -> Optional[Tuple[int, Optional[
     return (row[0], row[1]) if row else None
 
 
-_WriteFn = Callable[[AsyncSession, int, Optional[str]], Awaitable[Optional[ProvenanceEntry]]]
+_WriteFn = Callable[[AsyncSession, int, str | None], Awaitable[ProvenanceEntry | None]]
 
 
-async def append_chained_many(write_fns: List[_WriteFn]) -> List[Optional[ProvenanceEntry]]:
+async def append_chained_many(write_fns: list[_WriteFn]) -> list[ProvenanceEntry | None]:
     """Run many logical chained writes as ONE transaction claiming consecutive slots.
 
     This is the batching seam: one lock acquisition, one head read, and one
@@ -95,7 +96,7 @@ async def append_chained_many(write_fns: List[_WriteFn]) -> List[Optional[Proven
                         head = await get_chain_head(session)
                         next_seq = head[0] + 1 if head else 1
                         prev_checksum = head[1] if head else None
-                        results: List[Optional[ProvenanceEntry]] = []
+                        results: list[ProvenanceEntry | None] = []
                         for write_fn in write_fns:
                             entry = await write_fn(session, next_seq, prev_checksum)
                             if entry is not None and entry.sequence_id == next_seq:
@@ -115,7 +116,7 @@ async def append_chained(write_fn: _WriteFn) -> ProvenanceEntry:
     return (await append_chained_many([write_fn]))[0]
 
 
-async def retrieve_row(session: AsyncSession, entity_id: str) -> Optional[ProvenanceEntryRow]:
+async def retrieve_row(session: AsyncSession, entity_id: str) -> ProvenanceEntryRow | None:
     return await session.get(ProvenanceEntryRow, entity_id)
 
 
@@ -130,13 +131,98 @@ async def find_free_archive_id(session: AsyncSession, entity_id: str, last_updat
     return candidate
 
 
-async def retrieve(entity_id: str) -> Optional[ProvenanceEntry]:
+async def archive_and_replace(
+    session: AsyncSession,
+    existing_row: ProvenanceEntryRow,
+    old_snapshot: ProvenanceEntry,
+    archived_history_id: str,
+    entry: ProvenanceEntry,
+) -> None:
+    """Relabel the live row's old state to ``archived_history_id`` and make
+    ``entry`` the live row — the one versioning primitive every re-track,
+    resurrection and tombstone goes through.
+
+    Statement order matters: the unique sequence index is checked per
+    statement. UPDATE the live row first (freeing its old slot), then INSERT
+    the archive row carrying the old values. The archive is a pure relabel:
+    it keeps its checksum, sequence_id and previous_checksum exactly as they
+    were (``compute_checksum`` hashes the canonical id, so it still verifies).
+    """
+    entry.apply_to_row(existing_row)
+    await session.flush()
+    archive_entry = old_snapshot.model_copy(update={"entity_id": archived_history_id})
+    session.add(archive_entry.to_row())
+    await session.flush()
+
+
+async def retrieve(entity_id: str) -> ProvenanceEntry | None:
     async with get_async_session() as session:
         row = await retrieve_row(session, entity_id)
         return ProvenanceEntry.from_row(row) if row else None
 
 
-async def retrieve_many(entity_ids: List[str]) -> List[Optional[ProvenanceEntry]]:
+_IN_CHUNK = 500
+
+
+async def retrieve_live_ids(entity_ids: list[str]) -> list[str]:
+    """The subset of ``entity_ids`` that exist in the ledger and are not
+    tombstoned, in input order (exact-key lookup, so archives never match)."""
+    if not entity_ids:
+        return []
+    wanted = list(dict.fromkeys(entity_ids))
+    live: set[str] = set()
+    async with get_async_session() as session:
+        for start in range(0, len(wanted), _IN_CHUNK):
+            chunk = wanted[start : start + _IN_CHUNK]
+            result = await session.execute(
+                select(ProvenanceEntryRow.entity_id).where(
+                    ProvenanceEntryRow.entity_id.in_(chunk),
+                    ProvenanceEntryRow.invalidated.is_not(True),
+                )
+            )
+            live.update(result.scalars())
+    return [entity_id for entity_id in wanted if entity_id in live]
+
+
+async def iter_live_with_prefix(prefix: str, page_size: int = 1000) -> AsyncIterator[str]:
+    """Stream the ids of live (non-tombstoned, non-archive) entries whose
+    entity_id starts with ``prefix``, keyset-paginated on the PK.
+
+    Archive relabels (``"{id}:v:{last_updated}"``) share the prefix of the
+    entry they snapshot, so they are filtered out by recognizing the suffix
+    from the row's own ``last_updated`` (see ``canonical_entity_id``).
+    """
+    last_entity_id: str | None = None
+    async with get_async_session() as session:
+        while True:
+            statement = select(ProvenanceEntryRow.entity_id, ProvenanceEntryRow.last_updated).where(
+                ProvenanceEntryRow.entity_id.like(f"{prefix}%"),
+                ProvenanceEntryRow.invalidated.is_not(True),
+            )
+            if last_entity_id is not None:
+                statement = statement.where(ProvenanceEntryRow.entity_id > last_entity_id)
+            statement = statement.order_by(ProvenanceEntryRow.entity_id.asc()).limit(page_size)
+            rows = (await session.execute(statement)).all()
+            if not rows:
+                return
+            for entity_id, last_updated in rows:
+                probe = _IdProbe(entity_id, last_updated)
+                if canonical_entity_id(probe) == entity_id:
+                    yield entity_id
+            last_entity_id = rows[-1][0]
+
+
+class _IdProbe:
+    """Minimal duck-typed view for ``canonical_entity_id`` over an id column pair."""
+
+    __slots__ = ("entity_id", "last_updated")
+
+    def __init__(self, entity_id: str, last_updated: str | None):
+        self.entity_id = entity_id
+        self.last_updated = last_updated
+
+
+async def retrieve_many(entity_ids: list[str]) -> list[ProvenanceEntry | None]:
     """Fetch several entries in one session, preserving input order (None gaps)."""
     if not entity_ids:
         return []
@@ -150,7 +236,7 @@ async def retrieve_many(entity_ids: List[str]) -> List[Optional[ProvenanceEntry]
     return [by_id.get(entity_id) for entity_id in entity_ids]
 
 
-async def retrieve_all() -> List[ProvenanceEntry]:
+async def retrieve_all() -> list[ProvenanceEntry]:
     """Materialize the whole ledger. Small ledgers / tests only — the audit
     walks (``verify_chain``/``check``) use the paged iterators below."""
     async with get_async_session() as session:
@@ -158,18 +244,21 @@ async def retrieve_all() -> List[ProvenanceEntry]:
         return [ProvenanceEntry.from_row(row) for row in rows]
 
 
-async def iter_chained(page_size: int = 1000) -> AsyncIterator[ProvenanceEntry]:
+async def iter_chained(page_size: int = 1000, dataset_id=None) -> AsyncIterator[ProvenanceEntry]:
     """Stream chained entries in ``sequence_id`` order, one page at a time.
 
     Keyset pagination on the unique partial index — constant memory no matter
-    how large the append-only ledger has grown.
+    how large the append-only ledger has grown. ``dataset_id`` narrows the
+    stream to that dataset's key namespace (positions are then sparse).
     """
-    last_sequence_id: Optional[int] = None
+    last_sequence_id: int | None = None
     async with get_async_session() as session:
         while True:
             statement = select(ProvenanceEntryRow).where(
                 ProvenanceEntryRow.sequence_id.is_not(None)
             )
+            if dataset_id is not None:
+                statement = statement.where(dataset_scope_clause(dataset_id))
             if last_sequence_id is not None:
                 statement = statement.where(ProvenanceEntryRow.sequence_id > last_sequence_id)
             statement = statement.order_by(ProvenanceEntryRow.sequence_id.asc()).limit(page_size)
@@ -181,12 +270,50 @@ async def iter_chained(page_size: int = 1000) -> AsyncIterator[ProvenanceEntry]:
             last_sequence_id = rows[-1].sequence_id
 
 
-async def iter_all(page_size: int = 1000) -> AsyncIterator[ProvenanceEntry]:
-    """Stream every ledger entry (keyset pagination on the PK), constant memory."""
-    last_entity_id: Optional[str] = None
+def dataset_scope_clause(dataset_id):
+    """SQL predicate selecting the rows a dataset owns.
+
+    The ledger has no dataset column; ownership is encoded in the key
+    namespace (``{dataset_id}:{node_id}`` for nodes, chunks and summaries,
+    ``rel:{dataset_id}:...`` for edges — see ``tombstones.ledger_node_key``).
+    Archive copies keep their prefix, so they are in scope too.
+    """
+    prefix = f"{dataset_id}:"
+    return or_(
+        ProvenanceEntryRow.entity_id.like(f"{prefix}%"),
+        ProvenanceEntryRow.entity_id.like(f"rel:{prefix}%"),
+    )
+
+
+def archive_clause():
+    """SQL predicate selecting archive copies (``{id}:v:{last_updated}[:n]``).
+
+    The SQL form of ``integrity.canonical_entity_id``: an archive id embeds
+    the row's OWN ``last_updated``, so the marker can be matched column to
+    column without a Python pass.
+    """
+    marker = literal("%:v:") + ProvenanceEntryRow.last_updated + literal("%")
+    return and_(
+        ProvenanceEntryRow.last_updated.is_not(None), ProvenanceEntryRow.entity_id.like(marker)
+    )
+
+
+def live_clause():
+    """SQL predicate selecting the current (non-archive) row of every entity."""
+    return not_(archive_clause())
+
+
+async def iter_all(page_size: int = 1000, dataset_id=None) -> AsyncIterator[ProvenanceEntry]:
+    """Stream every ledger entry (keyset pagination on the PK), constant memory.
+
+    ``dataset_id`` narrows the stream to that dataset's key namespace.
+    """
+    last_entity_id: str | None = None
     async with get_async_session() as session:
         while True:
             statement = select(ProvenanceEntryRow)
+            if dataset_id is not None:
+                statement = statement.where(dataset_scope_clause(dataset_id))
             if last_entity_id is not None:
                 statement = statement.where(ProvenanceEntryRow.entity_id > last_entity_id)
             statement = statement.order_by(ProvenanceEntryRow.entity_id.asc()).limit(page_size)
@@ -216,48 +343,91 @@ async def retrieve_all_activity_ids() -> set:
         return set(result.scalars())
 
 
-async def aggregate_statistics() -> Dict:
-    """DB-side ledger statistics — no client-side full-table load."""
+async def aggregate_statistics(dataset_id=None) -> dict:
+    """DB-side ledger statistics — no client-side full-table load.
+
+    ``total_entries`` counts every row (archives included — the ledger is
+    append-only, so that is its true size); ``live_entries`` /
+    ``archived_entries`` split it. ``invalidated_count`` counts LIVE
+    tombstones only: a tombstone that was later resurrected leaves an
+    archived copy with ``invalidated=True`` behind, and counting that would
+    report retractions that are no longer in force.
+    """
+    scope = [dataset_scope_clause(dataset_id)] if dataset_id is not None else []
+
     async with get_async_session() as session:
         total = (
-            await session.execute(select(func.count()).select_from(ProvenanceEntryRow))
+            await session.execute(
+                select(func.count()).select_from(ProvenanceEntryRow).where(*scope)
+            )
+        ).scalar()
+        archived = (
+            await session.execute(
+                select(func.count()).select_from(ProvenanceEntryRow).where(archive_clause(), *scope)
+            )
         ).scalar()
         type_rows = await session.execute(
-            select(ProvenanceEntryRow.entity_type, func.count()).group_by(
-                ProvenanceEntryRow.entity_type
-            )
+            select(ProvenanceEntryRow.entity_type, func.count())
+            .where(*scope)
+            .group_by(ProvenanceEntryRow.entity_type)
         )
         unique_sources = (
             await session.execute(
                 select(func.count(distinct(ProvenanceEntryRow.source_document))).where(
                     ProvenanceEntryRow.source_document.is_not(None),
                     ProvenanceEntryRow.source_document != "",
+                    *scope,
                 )
             )
         ).scalar()
         invalidated_count = (
             await session.execute(
-                select(func.count()).where(ProvenanceEntryRow.invalidated.is_(True))
+                select(func.count()).where(
+                    ProvenanceEntryRow.invalidated.is_(True), live_clause(), *scope
+                )
             )
         ).scalar()
+    total = total or 0
+    archived = archived or 0
     return {
-        "total_entries": total or 0,
+        "total_entries": total,
+        "live_entries": total - archived,
+        "archived_entries": archived,
         "entity_types": {entity_type: count for entity_type, count in type_rows},
         "unique_sources": unique_sources or 0,
         "invalidated_count": invalidated_count or 0,
+        "dataset_id": str(dataset_id) if dataset_id is not None else None,
     }
 
 
-async def trace_lineage(entity_id: str, max_depth: Optional[int] = None) -> List[ProvenanceEntry]:
+async def retrieve_checksums_by_sequence(sequence_ids: list[int]) -> dict[int, str | None]:
+    """``{sequence_id: checksum}`` for the given chained positions (chunked IN)."""
+    found: dict[int, str | None] = {}
+    if not sequence_ids:
+        return found
+    async with get_async_session() as session:
+        for start in range(0, len(sequence_ids), 500):
+            chunk = sequence_ids[start : start + 500]
+            rows = await session.execute(
+                select(ProvenanceEntryRow.sequence_id, ProvenanceEntryRow.checksum).where(
+                    ProvenanceEntryRow.sequence_id.in_(chunk)
+                )
+            )
+            for sequence_id, checksum in rows:
+                found[sequence_id] = checksum
+    return found
+
+
+async def trace_lineage(entity_id: str, max_depth: int | None = None) -> list[ProvenanceEntry]:
     """Batched BFS over parent_entity_id + used_entities links, seed at depth 0.
 
     One SELECT per level (``WHERE entity_id IN (frontier)``), output in BFS
     order. Matching semantica's depth semantics: with ``max_depth`` set, only
     nodes at depth < max_depth are visited.
     """
-    lineage: List[ProvenanceEntry] = []
+    lineage: list[ProvenanceEntry] = []
     visited: set = set()
-    frontier: List[str] = [entity_id]
+    frontier: list[str] = [entity_id]
     depth = 0
 
     async with get_async_session() as session:
@@ -272,7 +442,7 @@ async def trace_lineage(entity_id: str, max_depth: Optional[int] = None) -> List
             ).scalars()
             by_id = {row.entity_id: ProvenanceEntry.from_row(row) for row in rows}
 
-            next_frontier: List[str] = []
+            next_frontier: list[str] = []
             for current_id in frontier:
                 if current_id in visited:
                     continue
@@ -295,7 +465,6 @@ async def trace_lineage(entity_id: str, max_depth: Optional[int] = None) -> List
 
 async def clear() -> int:
     """Delete every ledger row (dev/test teardown only). Returns rows removed."""
-    async with get_async_session() as session:
-        async with session.begin():
-            result = await session.execute(delete(ProvenanceEntryRow))
-            return result.rowcount or 0
+    async with get_async_session() as session, session.begin():
+        result = await session.execute(delete(ProvenanceEntryRow))
+        return result.rowcount or 0

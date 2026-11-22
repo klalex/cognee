@@ -1,14 +1,13 @@
 import argparse
 import asyncio
 import os
-from typing import Optional
 
-from cognee.cli.reference import SupportsCliCommand
+import cognee.cli.echo as fmt
 from cognee.cli import DEFAULT_DOCS_URL
 from cognee.cli.config import CHUNKER_CHOICES
-import cognee.cli.echo as fmt
 from cognee.cli.exceptions import CliCommandException, CliCommandInnerException
 from cognee.cli.hints import hint_recall
+from cognee.cli.reference import SupportsCliCommand
 
 
 class CognifyCommand(SupportsCliCommand):
@@ -54,8 +53,9 @@ After successful cognify processing, use `cognee search` to query the knowledge 
         parser.add_argument(
             "--chunker",
             choices=CHUNKER_CHOICES,
-            default="TextChunker",
-            help="Text chunking strategy (default: TextChunker)",
+            default=None,
+            help="Text chunking strategy (default: the DEFAULT_CHUNKER setting, TextChunker "
+            "when unset)",
         )
         parser.add_argument(
             "--background",
@@ -118,21 +118,25 @@ After successful cognify processing, use `cognee search` to query the knowledge 
                     # Import chunker classes here
                     from cognee.modules.chunking.TextChunker import TextChunker
 
-                    chunker_class = TextChunker  # Default
+                    chunker_class = TextChunker if args.chunker == "TextChunker" else None
                     if args.chunker == "LangchainChunker":
                         try:
                             from cognee.modules.chunking.LangchainChunker import LangchainChunker
 
                             chunker_class = LangchainChunker
-                        except ImportError:
-                            fmt.warning("LangchainChunker not available, using TextChunker")
+                        except ImportError as error:
+                            raise CliCommandInnerException(
+                                "LangchainChunker needs langchain: pip install 'cognee[langchain]'"
+                            ) from error
                     elif args.chunker == "CsvChunker":
                         try:
                             from cognee.modules.chunking.CsvChunker import CsvChunker
 
                             chunker_class = CsvChunker
-                        except ImportError:
-                            fmt.warning("CsvChunker not available, using TextChunker")
+                        except ImportError as error:
+                            raise CliCommandInnerException(
+                                f"CsvChunker could not be imported: {error}"
+                            ) from error
 
                     # Translate --ontology-file into the canonical ontology Config
                     # structure, built with the same factory cognify() uses for
@@ -165,7 +169,7 @@ After successful cognify processing, use `cognee search` to query the knowledge 
                     )
                     return result
                 except Exception as e:
-                    raise CliCommandInnerException(f"Failed to cognify: {str(e)}") from e
+                    raise CliCommandInnerException(f"Failed to cognify: {e!s}") from e
 
             result = asyncio.run(run_cognify())
 
@@ -192,4 +196,4 @@ After successful cognify processing, use `cognee search` to query the knowledge 
         except Exception as e:
             if isinstance(e, CliCommandInnerException):
                 raise CliCommandException(str(e), error_code=1) from e
-            raise CliCommandException(f"Error during cognification: {str(e)}", error_code=1) from e
+            raise CliCommandException(f"Error during cognification: {e!s}", error_code=1) from e

@@ -1,7 +1,9 @@
+from typing import Any
+
 import numpy as np
-from typing import List, Dict, Optional, Any, Union
-from pydantic import BaseModel, ConfigDict, field_serializer
-from cognee.modules.graph.exceptions import InvalidDimensionsError, DimensionOutOfRangeError
+from pydantic import BaseModel, ConfigDict, PrivateAttr, computed_field, field_serializer
+
+from cognee.modules.graph.exceptions import DimensionOutOfRangeError, InvalidDimensionsError
 
 
 class Node(BaseModel):
@@ -10,21 +12,29 @@ class Node(BaseModel):
     Attributes:
         id (str): A unique identifier for the node.
         attributes (Dict[str, Any]): A dictionary of attributes associated with the node.
-        neighbors (List[Node]): Represents the original nodes
-        skeleton_edges (List[Edge]): Represents the original edges
+        skeleton_neighbours (List[Node]): The neighbouring nodes, in the order they were
+            added. Read-only: every read returns a new list, so changing it does not change
+            the node; use add_skeleton_neighbor and remove_skeleton_neighbor.
+        skeleton_edges (List[Edge]): The edges that connect this node to its neighbours.
+        status (np.ndarray): Whether the node is alive (1) or not (0) in each dimension.
     """
 
     id: str
-    attributes: Dict[str, Any]
-    skeleton_neighbours: List["Node"]
-    skeleton_edges: List["Edge"]
+    attributes: dict[str, Any]
+    skeleton_edges: list["Edge"]
     status: np.ndarray
     model_config = ConfigDict(arbitrary_types_allowed=True)
+    # Neighbours by id, in the order they were added. The dict makes the duplicate
+    # check one lookup and keeps the order, so no separate list is stored. A list
+    # scan made projecting a node with N edges O(N^2): minutes for a hub of ~50k edges.
+    # Created in __init__, not by a default factory: pydantic 2.13 inspects a private
+    # attribute's factory for every instance, which costs more than building the node.
+    _neighbours: dict[str, "Node"] = PrivateAttr()
 
     def __init__(
         self,
         node_id: str,
-        attributes: Optional[Dict[str, Any]] = None,
+        attributes: dict[str, Any] | None = None,
         dimension: int = 1,
         node_penalty: float = 6.5,
     ):
@@ -35,29 +45,39 @@ class Node(BaseModel):
         super().__init__(
             id=node_id,
             attributes=node_attributes,
-            skeleton_neighbours=[],
             skeleton_edges=[],
             status=np.ones(dimension, dtype=int),
         )
+        self._neighbours = {}
+
+    @computed_field  # type: ignore[prop-decorator]
+    @property
+    def skeleton_neighbours(self) -> list["Node"]:
+        """The neighbours in the order they were added, as a new list on every read.
+
+        Changing the returned list does not change the node: use
+        add_skeleton_neighbor and remove_skeleton_neighbor.
+        """
+        return list(self._neighbours.values())
 
     @field_serializer("status")
-    def serialize_status(self, status: np.ndarray, _info) -> List[int]:
+    def serialize_status(self, status: np.ndarray, _info) -> list[int]:
         return status.tolist()
 
     @field_serializer("skeleton_neighbours")
     def serialize_skeleton_neighbours(
-        self, neighbours: List["Node"], _info
-    ) -> List[Dict[str, Any]]:
+        self, neighbours: list["Node"], _info
+    ) -> list[dict[str, Any]]:
         return [n.to_json() for n in neighbours]
 
     @field_serializer("skeleton_edges")
-    def serialize_skeleton_edges(self, edges: List["Edge"], _info) -> List[Dict[str, Any]]:
+    def serialize_skeleton_edges(self, edges: list["Edge"], _info) -> list[dict[str, Any]]:
         return [e.to_json() for e in edges]
 
     def reset_vector_distances(self, query_count: int, default_penalty: float) -> None:
         self.attributes["vector_distance"] = [default_penalty] * query_count
 
-    def ensure_vector_distance_list(self, query_count: int, default_penalty: float) -> List[float]:
+    def ensure_vector_distance_list(self, query_count: int, default_penalty: float) -> list[float]:
         distances = self.attributes.get("vector_distance")
         if not isinstance(distances, list) or len(distances) != query_count:
             distances = [default_penalty] * query_count
@@ -75,12 +95,10 @@ class Node(BaseModel):
         distances[query_index] = score
 
     def add_skeleton_neighbor(self, neighbor: "Node") -> None:
-        if neighbor not in self.skeleton_neighbours:
-            self.skeleton_neighbours.append(neighbor)
+        self._neighbours.setdefault(neighbor.id, neighbor)
 
     def remove_skeleton_neighbor(self, neighbor: "Node") -> None:
-        if neighbor in self.skeleton_neighbours:
-            self.skeleton_neighbours.remove(neighbor)
+        self._neighbours.pop(neighbor.id, None)
 
     def add_skeleton_edge(self, edge: "Edge") -> None:
         self.skeleton_edges.append(edge)
@@ -106,16 +124,20 @@ class Node(BaseModel):
     def add_attribute(self, key: str, value: Any) -> None:
         self.attributes[key] = value
 
-    def get_attribute(self, key: str) -> Union[str, int, float]:
+    def get_attribute(self, key: str) -> str | int | float:
         return self.attributes[key]
 
     def get_skeleton_edges(self):
         return self.skeleton_edges
 
     def get_skeleton_neighbours(self):
+        """Return the neighbours in the order they were added, as a new list.
+
+        Changing the returned list does not change the node.
+        """
         return self.skeleton_neighbours
 
-    def to_json(self) -> Dict[str, Any]:
+    def to_json(self) -> dict[str, Any]:
         return {
             "node_id": self.id,
             "node_attributes": self.attributes,
@@ -143,7 +165,7 @@ class Edge(BaseModel):
 
     node1: "Node"
     node2: "Node"
-    attributes: Dict[str, Any]
+    attributes: dict[str, Any]
     directed: bool
     status: np.ndarray
     model_config = ConfigDict(arbitrary_types_allowed=True)
@@ -152,7 +174,7 @@ class Edge(BaseModel):
         self,
         node1: "Node",
         node2: "Node",
-        attributes: Optional[Dict[str, Any]] = None,
+        attributes: dict[str, Any] | None = None,
         directed: bool = True,
         dimension: int = 1,
         edge_penalty: float = 6.5,
@@ -170,14 +192,14 @@ class Edge(BaseModel):
         )
 
     @field_serializer("status")
-    def serialize_status(self, status: np.ndarray, _info) -> List[int]:
+    def serialize_status(self, status: np.ndarray, _info) -> list[int]:
         return status.tolist()
 
     @field_serializer("node1", "node2")
-    def serialize_node(self, node: "Node", _info) -> Dict[str, Any]:
+    def serialize_node(self, node: "Node", _info) -> dict[str, Any]:
         return node.to_json()
 
-    def get_distance_key(self) -> Optional[str]:
+    def get_distance_key(self) -> str | None:
         key = self.attributes.get("edge_type_id")
         if key is None:
             return None
@@ -186,7 +208,7 @@ class Edge(BaseModel):
     def reset_vector_distances(self, query_count: int, default_penalty: float) -> None:
         self.attributes["vector_distance"] = [default_penalty] * query_count
 
-    def ensure_vector_distance_list(self, query_count: int, default_penalty: float) -> List[float]:
+    def ensure_vector_distance_list(self, query_count: int, default_penalty: float) -> list[float]:
         distances = self.attributes.get("vector_distance")
         if not isinstance(distances, list) or len(distances) != query_count:
             distances = [default_penalty] * query_count
@@ -211,7 +233,7 @@ class Edge(BaseModel):
     def add_attribute(self, key: str, value: Any) -> None:
         self.attributes[key] = value
 
-    def get_attribute(self, key: str) -> Optional[Union[str, int, float]]:
+    def get_attribute(self, key: str) -> str | int | float | None:
         return self.attributes.get(key)
 
     def get_source_node(self):
@@ -220,7 +242,7 @@ class Edge(BaseModel):
     def get_destination_node(self):
         return self.node2
 
-    def to_json(self) -> Dict[str, Any]:
+    def to_json(self) -> dict[str, Any]:
         return {
             "source_node_id": self.node1.id,
             "target_node_id": self.node2.id,

@@ -9,8 +9,8 @@ import pytest
 
 from cognee.infrastructure.databases.graph.ladybug.ladybug_migrate import (
     ladybug_version_mapping,
-    run_migration_step,
     read_ladybug_storage_version,
+    run_migration_step,
 )
 
 
@@ -60,6 +60,12 @@ def test_read_ladybug_storage_version_0_18_code(tmp_path):
     # sits at byte offset 4, so the parser must map it the same way.
     _write_catalog_kz(str(tmp_path), 42, magic=b"LBUG")
     assert read_ladybug_storage_version(str(tmp_path)) == "0.18.2"
+
+
+def test_read_ladybug_storage_version_0_22_code(tmp_path):
+    # 0.22.3 writes storage code 49 (read from a store the published wheel wrote).
+    _write_catalog_kz(str(tmp_path), 49, magic=b"LBUG")
+    assert read_ladybug_storage_version(str(tmp_path)) == "0.22.3"
 
 
 def test_read_ladybug_storage_version_unknown_code_raises(tmp_path):
