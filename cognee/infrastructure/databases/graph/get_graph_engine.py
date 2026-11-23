@@ -32,6 +32,7 @@ def _try_load_falkor_adapter() -> None:
     from cognee.infrastructure.databases.hybrid.falkor.compat import (
         patch_falkor_adapter_filtered_graph_data,
         patch_falkor_adapter_graph_data,
+        patch_falkor_adapter_has_collection,
         patch_falkor_adapter_provenance_kwargs,
         patch_falkor_adapter_retrieve,
     )
@@ -56,6 +57,7 @@ def _try_load_falkor_adapter() -> None:
     patch_falkor_adapter_provenance_kwargs()
     patch_falkor_adapter_graph_data()
     patch_falkor_adapter_filtered_graph_data()
+    patch_falkor_adapter_has_collection()
     patch_falkor_adapter_retrieve()
 
 

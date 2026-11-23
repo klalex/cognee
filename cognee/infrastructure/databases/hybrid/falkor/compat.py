@@ -8,6 +8,7 @@ from typing import Callable
 _PROVENANCE_KWARGS_PATCHED = False
 _FILTERED_GRAPH_DATA_PATCHED = False
 _RETRIEVE_PATCHED = False
+_HAS_COLLECTION_PATCHED = False
 
 
 def patch_falkor_adapter_graph_data() -> None:
@@ -119,6 +120,59 @@ def patch_falkor_adapter_filtered_graph_data() -> None:
 
     setattr(FalkorDBAdapter, "get_filtered_graph_data", _wrap_include_edges(original))
     _FILTERED_GRAPH_DATA_PATCHED = True
+
+
+def patch_falkor_adapter_has_collection() -> None:
+    """Treat a vector collection as present when its Falkor vector index exists.
+
+    Newer Cognee asks ``existing_collections`` before a graph search and skips
+    every name that ``has_collection`` rejects. The community adapter answers
+    that with ``list_graphs()``, which is the graph name, not ``Entity_name``
+    or ``DocumentChunk_text``. Every collection is skipped, triplet search
+    finds nothing, and graph completion returns an empty ``search_result``.
+    ``search()`` already decides the same question with ``has_vector_index``.
+    """
+    global _HAS_COLLECTION_PATCHED
+    if _HAS_COLLECTION_PATCHED:
+        return
+
+    try:
+        from cognee_community_hybrid_adapter_falkor.falkor_adapter import FalkorDBAdapter
+    except Exception:
+        return
+
+    original = getattr(FalkorDBAdapter, "has_collection", None)
+    if original is None:
+        return
+
+    setattr(FalkorDBAdapter, "has_collection", _wrap_has_collection(original))
+    _HAS_COLLECTION_PATCHED = True
+
+
+def _vector_index_parts(collection_name: str) -> tuple[str, str] | None:
+    if "_" not in collection_name:
+        return None
+    label, _, attribute = collection_name.partition("_")
+    if not label or not attribute:
+        return None
+    return label, f"{attribute}_vector"
+
+
+def _wrap_has_collection(original: Callable):
+    async def wrapped(self, collection_name: str) -> bool:
+        parts = _vector_index_parts(collection_name)
+        checker = getattr(self, "has_vector_index", None)
+        driver = getattr(self, "driver", None)
+        graph_name = getattr(self, "graph_name", None)
+        if parts and callable(checker) and driver is not None and graph_name:
+            label, property_name = parts
+            graph = driver.select_graph(graph_name)
+            return bool(checker(graph, label, property_name))
+        return await original(self, collection_name)
+
+    wrapped.__name__ = getattr(original, "__name__", "wrapped")
+    wrapped.__doc__ = getattr(original, "__doc__", None)
+    return wrapped
 
 
 def patch_falkor_adapter_retrieve() -> None:

@@ -219,6 +219,40 @@ async def test_retrieve_accepts_include_vector_from_node_properties(monkeypatch)
 
 
 @pytest.mark.asyncio
+async def test_has_collection_uses_the_vector_index_not_the_graph_name(monkeypatch):
+    class LegacyAdapter:
+        graph_name = "cognee"
+
+        def __init__(self):
+            self.driver = self
+            self.checked = None
+
+        def select_graph(self, name):
+            return f"graph:{name}"
+
+        def has_vector_index(self, graph, label, property_name):
+            self.checked = (graph, label, property_name)
+            return label == "Entity" and property_name == "name_vector"
+
+        async def has_collection(self, collection_name):
+            return collection_name == "cognee"
+
+    child = types.ModuleType("cognee_community_hybrid_adapter_falkor.falkor_adapter")
+    child.FalkorDBAdapter = LegacyAdapter
+    monkeypatch.setitem(sys.modules, child.__name__, child)
+    monkeypatch.setattr(compat, "_HAS_COLLECTION_PATCHED", False)
+
+    compat.patch_falkor_adapter_has_collection()
+    compat.patch_falkor_adapter_has_collection()
+    adapter = LegacyAdapter()
+
+    assert await adapter.has_collection("Entity_name") is True
+    assert adapter.checked == ("graph:cognee", "Entity", "name_vector")
+    assert await adapter.has_collection("DocumentChunk_text") is False
+    assert await adapter.has_collection("cognee") is True
+
+
+@pytest.mark.asyncio
 async def test_retrieve_leaves_scored_rows_unchanged():
     scored = SimpleNamespace(id="already-scored", payload={"text": "kept"})
     assert compat._scored_retrieve_rows([scored, []]) == [scored]
