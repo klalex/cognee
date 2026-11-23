@@ -175,6 +175,50 @@ async def test_retrieve_wraps_falkor_node_rows_as_scored_results(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_retrieve_accepts_include_vector_from_node_properties(monkeypatch):
+    class Node:
+        def __init__(self, properties):
+            self.properties = properties
+
+    seen = {}
+
+    class LegacyAdapter:
+        async def retrieve(self, collection_name, data_point_ids):
+            seen["args"] = (collection_name, data_point_ids)
+            return [
+                [
+                    Node(
+                        {
+                            "id": "3d789d76-638a-5e88-beb1-59e34e1486b4",
+                            "text": "summary",
+                            "text_vector": [0.25, 0.5],
+                        }
+                    )
+                ]
+            ]
+
+    child = types.ModuleType("cognee_community_hybrid_adapter_falkor.falkor_adapter")
+    child.FalkorDBAdapter = LegacyAdapter
+    monkeypatch.setitem(sys.modules, child.__name__, child)
+    monkeypatch.setattr(compat, "_RETRIEVE_PATCHED", False)
+
+    compat.patch_falkor_adapter_retrieve()
+    rows = await LegacyAdapter().retrieve(
+        "GlobalContextSummary_text",
+        ["3d789d76-638a-5e88-beb1-59e34e1486b4"],
+        include_vector=True,
+    )
+
+    assert seen["args"] == (
+        "GlobalContextSummary_text",
+        ["3d789d76-638a-5e88-beb1-59e34e1486b4"],
+    )
+    assert rows[0].payload["text"] == "summary"
+    assert rows[0].payload["vector"] == [0.25, 0.5]
+    assert "text_vector" not in rows[0].payload
+
+
+@pytest.mark.asyncio
 async def test_retrieve_leaves_scored_rows_unchanged():
     scored = SimpleNamespace(id="already-scored", payload={"text": "kept"})
     assert compat._scored_retrieve_rows([scored, []]) == [scored]

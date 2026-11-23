@@ -158,7 +158,50 @@ def _node_properties(cell) -> dict:
     return {}
 
 
-def _scored_retrieve_rows(rows):
+def _collection_vector_key(collection_name: str | None) -> str | None:
+    if not collection_name or "_" not in collection_name:
+        return None
+    attribute = collection_name.partition("_")[2]
+    return f"{attribute}_vector" if attribute else None
+
+
+def _as_float_vector(value):
+    if value is None:
+        return None
+    if isinstance(value, str):
+        start, end = value.find("["), value.rfind("]")
+        if start < 0 or end <= start:
+            return None
+        try:
+            return [float(part) for part in value[start + 1 : end].split(",") if part.strip()]
+        except ValueError:
+            return None
+    if hasattr(value, "tolist"):
+        value = value.tolist()
+    try:
+        vector = [float(item) for item in value]
+    except (TypeError, ValueError):
+        return None
+    return vector or None
+
+
+def _take_stored_vector(payload: dict, collection_name: str | None) -> list[float] | None:
+    """Move a Falkor ``*_vector`` property to the ``vector`` key other adapters use."""
+    preferred = _collection_vector_key(collection_name)
+    keys = [preferred] if preferred and preferred in payload else []
+    keys.extend(key for key in payload if key.endswith("_vector") and key not in keys)
+    vector = None
+    for key in keys:
+        vector = _as_float_vector(payload.get(key))
+        if vector:
+            break
+    for key in list(payload):
+        if key.endswith("_vector"):
+            payload.pop(key, None)
+    return vector
+
+
+def _scored_retrieve_rows(rows, *, collection_name: str | None = None, include_vector: bool = False):
     from cognee.infrastructure.databases.vector.models.ScoredResult import ScoredResult
     from cognee.infrastructure.engine.utils.parse_id import parse_id
 
@@ -168,6 +211,11 @@ def _scored_retrieve_rows(rows):
     scored = []
     for row in rows:
         if not isinstance(row, (list, tuple)):
+            if include_vector and isinstance(getattr(row, "payload", None), dict):
+                if row.payload.get("vector") is None:
+                    vector = _take_stored_vector(row.payload, collection_name)
+                    if vector is not None:
+                        row.payload["vector"] = vector
             scored.append(row)
             continue
         cell = row[0] if row else None
@@ -177,14 +225,35 @@ def _scored_retrieve_rows(rows):
             node_id = getattr(cell, "id", None)
         if node_id is None:
             continue
+        if include_vector:
+            vector = _take_stored_vector(payload, collection_name)
+            if vector is not None:
+                payload["vector"] = vector
         scored.append(ScoredResult(id=parse_id(node_id), payload=payload, score=0))
     return scored
 
 
 def _wrap_retrieve(original: Callable):
-    async def wrapped(self, collection_name, data_point_ids, *args, **kwargs):
-        rows = await original(self, collection_name, data_point_ids, *args, **kwargs)
-        return _scored_retrieve_rows(rows)
+    try:
+        accepts_include_vector = "include_vector" in inspect.signature(original).parameters
+    except (TypeError, ValueError):
+        accepts_include_vector = False
+
+    async def wrapped(self, collection_name, data_point_ids, *args, include_vector=False, **kwargs):
+        if accepts_include_vector:
+            rows = await original(
+                self,
+                collection_name,
+                data_point_ids,
+                *args,
+                include_vector=include_vector,
+                **kwargs,
+            )
+        else:
+            rows = await original(self, collection_name, data_point_ids, *args, **kwargs)
+        return _scored_retrieve_rows(
+            rows, collection_name=collection_name, include_vector=include_vector
+        )
 
     wrapped.__name__ = getattr(original, "__name__", "wrapped")
     wrapped.__doc__ = getattr(original, "__doc__", None)
